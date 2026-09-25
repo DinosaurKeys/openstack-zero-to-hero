@@ -1,0 +1,43 @@
+---
+- name: Prepare OpenStack nodes
+  hosts: openstack
+  become: true
+
+  tasks:
+
+    - name: Update APT package cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install basic administration packages
+      ansible.builtin.apt:
+        name:
+          - curl
+          - wget
+          - vim
+          - git
+          - jq
+          - htop
+          - net-tools
+          - ca-certificates
+          - python3
+        state: present
+
+    - name: Add OpenStack nodes to /etc/hosts
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} OPENSTACK HOMELAB"
+        block: |
+          192.168.0.200 node1
+          192.168.0.201 node2
+          192.168.0.202 node3
+
+    - name: Verify hostname
+      ansible.builtin.command: hostname
+      register: hostname_result
+      changed_when: false
+
+    - name: Display hostname
+      ansible.builtin.debug:
+        var: hostname_result.stdout

@@ -1,0 +1,63 @@
+- name: Prepare single-NIC OpenStack networking
+  hosts: openstack
+  become: true
+  serial: 1
+
+  tasks:
+
+    - name: Back up original Netplan configuration
+      ansible.builtin.copy:
+        src: /etc/netplan/50-cloud-init.yaml
+        dest: /etc/netplan/50-cloud-init.yaml.backup
+        remote_src: true
+        force: false
+
+    - name: Disable cloud-init network configuration
+      ansible.builtin.copy:
+        dest: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        content: |
+          network: {config: disabled}
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Write single-NIC Netplan configuration
+      ansible.builtin.copy:
+        dest: /etc/netplan/50-cloud-init.yaml
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          network:
+            version: 2
+            renderer: networkd
+
+            ethernets:
+              enp0s31f6:
+                dhcp4: false
+                dhcp6: false
+
+            virtual-ethernets:
+              veth-host:
+                peer: veth-ovs
+              veth-ovs:
+                peer: veth-host
+
+            bridges:
+              br-mgmt:
+                interfaces:
+                  - enp0s31f6
+                  - veth-host
+                addresses:
+                  - {{ ansible_host }}/24
+                routes:
+                  - to: default
+                    via: 192.168.0.1
+                nameservers:
+                  addresses:
+                    - 192.168.0.1
+                    - 1.1.1.1
+
+    - name: Validate Netplan configuration
+      ansible.builtin.command: netplan generate
+      changed_when: false

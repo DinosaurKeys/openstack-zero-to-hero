@@ -1,0 +1,70 @@
+---
+- name: OpenStack node preflight checks
+  hosts: openstack
+  become: true
+
+  tasks:
+
+    - name: Show hostname
+      ansible.builtin.command: hostname
+      register: hostname_output
+      changed_when: false
+
+    - name: Show network interfaces
+      ansible.builtin.command: ip -br addr
+      register: network_output
+      changed_when: false
+
+    - name: Show routing table
+      ansible.builtin.command: ip route
+      register: route_output
+      changed_when: false
+
+    - name: Show memory
+      ansible.builtin.command: free -h
+      register: memory_output
+      changed_when: false
+
+    - name: Show disks
+      ansible.builtin.command:
+        argv:
+          - lsblk
+          - -o
+          - NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
+      register: disk_output
+      changed_when: false
+
+    - name: Check CPU virtualization extensions
+      ansible.builtin.shell: |
+        grep -Eoc '(vmx|svm)' /proc/cpuinfo
+      register: virtualization_output
+      changed_when: false
+      failed_when: false
+
+    - name: Check KVM device
+      ansible.builtin.stat:
+        path: /dev/kvm
+      register: kvm_device
+
+    - name: Check time synchronization
+      ansible.builtin.command: timedatectl show --property=NTPSynchronized --value
+      register: ntp_output
+      changed_when: false
+
+    - name: Check swap
+      ansible.builtin.command: swapon --show
+      register: swap_output
+      changed_when: false
+
+    - name: Display preflight results
+      ansible.builtin.debug:
+        msg:
+          - "Hostname: {{ hostname_output.stdout }}"
+          - "Interfaces: {{ network_output.stdout_lines }}"
+          - "Routes: {{ route_output.stdout_lines }}"
+          - "Memory: {{ memory_output.stdout_lines }}"
+          - "Disks: {{ disk_output.stdout_lines }}"
+          - "Virtualization CPU flags: {{ virtualization_output.stdout }}"
+          - "KVM device exists: {{ kvm_device.stat.exists }}"
+          - "NTP synchronized: {{ ntp_output.stdout }}"
+          - "Swap: {{ swap_output.stdout_lines | default([]) }}"

@@ -1,0 +1,35 @@
+# Secrets / environment files
+.env
+*.env
+
+# SSH private keys
+id_rsa
+id_ed25519
+*.pem
+
+# OpenStack credentials
+admin-openrc.sh
+clouds.yaml
+passwords.yml
+
+# Terraform runtime/state
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+crash.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Ansible
+*.retry
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
