@@ -1475,3 +1475,20 @@ POST-DEPLOY
 ```
 
 That is the Kolla-Ansible lifecycle to remember.
+
+---
+
+# 54. Actual Post-Deployment Observations
+
+After `kolla-ansible deploy` completed successfully, the lab was inspected rather than immediately creating workloads.
+
+This allowed the theoretical architecture to be compared with the actual deployed environment.
+
+## Container Counts
+
+Before deployment:
+
+```text
+node1 = 0 containers
+node2 = 0 containers
+node3 = 0 containers
