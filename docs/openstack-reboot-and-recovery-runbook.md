@@ -1027,11 +1027,22 @@ Rules:
 
 # 22. Future automation
 
-This runbook should remain the human-readable source of truth.
+python3 - <<'PY'
+from pathlib import Path
 
-Future Hermes-side helper scripts can be built from it.
+path = Path("docs/openstack-reboot-and-recovery-runbook.md")
+text = path.read_text()
 
-Planned:
+marker = "# 22. Future automation"
+
+if marker not in text:
+    raise SystemExit("ERROR: Section 22 marker not found")
+
+head = text.split(marker, 1)[0]
+
+new_tail = r'''# 22. Current recovery helper scripts
+
+The helper scripts are now implemented:
 
 ```text
 scripts/lab-status.sh
@@ -1040,61 +1051,348 @@ scripts/lab-recover.sh
 
 ## lab-status.sh
 
-This script should be read-only.
+This script is read-only.
 
-It should not restart or modify anything.
+Run:
 
-Example future output:
+```bash
+cd ~/git/openstack-zero-to-hero
+./scripts/lab-status.sh
+```
+
+Healthy result:
 
 ```text
-OPENSTACK LAB STATUS
-
-Nodes ................. 3/3 reachable
-MariaDB ............... 3/3 healthy
-ProxySQL .............. 3/3 healthy
-Placement ............. PASS
-Nova control .......... PASS
-Nova compute .......... 3/3 UP
-Neutron agents ........ PASS
-Hypervisors ........... 3/3 UP
-
 RESULT: HEALTHY
+PASS checks: 14
 ```
+
+A non-zero exit status means attention is required.
+
+Example:
+
+```bash
+./scripts/lab-status.sh
+echo $?
+```
+
+```text
+0 = healthy
+1 = attention required
+```
+
+---
 
 ## lab-recover.sh
 
-This script should diagnose first.
+The recovery helper supports:
 
-It should only repair components that require recovery.
-
-Conceptually:
-
-```text
-Are nodes reachable?
-        ↓
-Check Galera
-        ↓
-Galera healthy?
-   ├── YES → continue
-   │
-   └── NO
-        ↓
-   mariadb-recovery
-        ↓
-Wait for MariaDB
-        ↓
-Check ProxySQL
-        ↓
-Check control plane
-        ↓
-Check compute services
-        ↓
-Restart only stale/broken services
-        ↓
-OpenStack validation
-        ↓
-PASS / FAIL
+```bash
+./scripts/lab-recover.sh --check
+./scripts/lab-recover.sh --plan
+./scripts/lab-recover.sh --apply
 ```
 
-The recovery script must never blindly restart the entire OpenStack deployment.
+Meaning:
 
+```text
+--check
+    read-only health check
+
+--plan
+    diagnose and describe proposed repairs
+
+--apply
+    request approval and repair supported failures
+```
+
+Important:
+
+```bash
+./scripts/lab-recover.sh
+```
+
+without an argument defaults to:
+
+```text
+--check
+```
+
+It does NOT perform recovery.
+
+The tested safety model is:
+
+```text
+diagnose
+   ↓
+plan
+   ↓
+human approval
+   ↓
+repair only broken services
+   ↓
+final health check
+```
+
+The script has been tested with a deliberately stopped
+`placement_api` on node1.
+
+It correctly detected:
+
+```text
+placement_api 2/3 healthy
+```
+
+proposed:
+
+```text
+restart placement_api on node1
+```
+
+and, after approval, restarted only that service.
+
+Final result:
+
+```text
+RESULT: HEALTHY
+```
+
+---
+
+# 23. Proven full cold-boot recovery procedure
+
+A complete shutdown of all three OpenStack nodes has now produced the
+same Galera failure more than once.
+
+The important pattern is:
+
+```text
+all three nodes powered off
+        ↓
+all Galera members disappear
+        ↓
+no surviving PRIMARY component
+        ↓
+MariaDB containers may show:
+
+running starting
+
+or:
+
+exited unhealthy
+
+        ↓
+MariaDB remains 0/3 healthy
+        ↓
+Keystone / Placement / Nova / Neutron fail
+```
+
+Important lesson:
+
+```text
+running != healthy
+```
+
+A MariaDB container being in:
+
+```text
+running starting
+```
+
+does NOT prove that the Galera cluster has recovered.
+
+---
+
+## Cold-boot Step 1: check the lab
+
+After powering on all nodes:
+
+```bash
+cd ~/git/openstack-zero-to-hero
+source ~/venvs/kolla/bin/activate
+
+export OS_CLIENT_CONFIG_FILE=/etc/kolla/clouds.yaml
+export OS_CLOUD=kolla-admin
+
+./scripts/lab-status.sh
+```
+
+If MariaDB reports:
+
+```text
+MariaDB: 3/3 healthy
+```
+
+do NOT run `mariadb-recovery`.
+
+Continue with normal service validation.
+
+---
+
+## Cold-boot Step 2: recognize the known Galera failure
+
+Known failure example:
+
+```text
+MariaDB: 0/3 healthy
+
+node1/mariadb=running starting
+node2/mariadb=running starting
+node3/mariadb=running starting
+```
+
+At the same time, dependent services may report:
+
+```text
+Placement unhealthy
+Nova unhealthy
+Neutron unhealthy
+Keystone authentication failed
+```
+
+Do NOT begin by restarting those services.
+
+The database is the first dependency to repair.
+
+---
+
+## Cold-boot Step 3: recover Galera
+
+Run:
+
+```bash
+kolla-ansible mariadb-recovery \
+  -i kolla/inventory/multinode
+```
+
+Do not manually:
+
+```text
+edit grastate.dat
+change safe_to_bootstrap
+run galera_new_cluster
+```
+
+during the normal Kolla recovery workflow.
+
+After recovery:
+
+```bash
+./scripts/lab-status.sh
+```
+
+The first required milestone is:
+
+```text
+MariaDB: 3/3 healthy
+ProxySQL: 3/3 healthy
+```
+
+---
+
+## Cold-boot Step 4: repair stale OpenStack services
+
+After MariaDB has recovered, some OpenStack processes may remain
+unhealthy because they started while the database was unavailable.
+
+First inspect the proposed actions:
+
+```bash
+./scripts/lab-recover.sh --plan
+```
+
+Confirm that MariaDB shows:
+
+```text
+3/3 healthy
+No mariadb-recovery required
+```
+
+Then inspect which Placement, Nova, or Neutron services are proposed
+for restart.
+
+If the plan is correct:
+
+```bash
+./scripts/lab-recover.sh --apply
+```
+
+At the prompt:
+
+```text
+Type APPLY to continue.
+```
+
+enter:
+
+```text
+APPLY
+```
+
+The script restarts supported unhealthy/stale services and performs a
+final health check.
+
+Target:
+
+```text
+RESULT: HEALTHY
+PASS checks: 14
+```
+
+---
+
+# 24. Preferred operating rule
+
+For normal maintenance:
+
+```text
+DO NOT reboot all three control nodes together.
+```
+
+Use:
+
+```text
+node1 reboot
+     ↓
+wait for HEALTHY
+     ↓
+node2 reboot
+     ↓
+wait for HEALTHY
+     ↓
+node3 reboot
+     ↓
+wait for HEALTHY
+```
+
+This allows the remaining Galera members to retain quorum.
+
+For an intentional full shutdown:
+
+```text
+expect possible Galera recovery
+```
+
+and use the procedure in Section 23.
+
+The practical cold-boot recovery sequence is:
+
+```text
+./scripts/lab-status.sh
+        ↓
+MariaDB 0/3?
+        ↓
+kolla-ansible mariadb-recovery
+        ↓
+./scripts/lab-status.sh
+        ↓
+MariaDB 3/3
+        ↓
+./scripts/lab-recover.sh --plan
+        ↓
+./scripts/lab-recover.sh --apply
+        ↓
+./scripts/lab-status.sh
+        ↓
+RESULT: HEALTHY
+```
