@@ -1370,3 +1370,411 @@ m1.cirros flavor
 ```
 
 This separation is intentional.
+
+---
+
+# 25. Destroy and Rebuild — Proving Reproducibility
+
+The first Terraform workload was now fully operational.
+
+Before testing reproducibility, Terraform confirmed that the deployed
+infrastructure matched the configuration:
+
+```bash
+terraform plan
+```
+
+Observed:
+
+```text
+No changes. Your infrastructure matches the configuration.
+```
+
+This means there was no detected configuration drift at that point.
+
+## Preview the Destroy
+
+Before deleting anything, preview the operation:
+
+```bash
+terraform plan -destroy
+```
+
+Observed:
+
+```text
+Plan: 0 to add, 0 to change, 11 to destroy.
+```
+
+Terraform planned to destroy only the resources it managed:
+
+```text
+tf-cirros-01
+tf-key
+floating IP
+floating-IP association
+tf-private
+tf-private-subnet
+tf-router
+tf-router interface
+tf-sg
+ICMP ingress rule
+SSH ingress rule
+```
+
+The following existing OpenStack resources were not Terraform-managed
+resources and therefore were not destroyed:
+
+```text
+public network
+cirros-0.6.3 image
+m1.cirros flavor
+manual private network
+manual cirros-01 VM
+```
+
+This demonstrates the difference between:
+
+```text
+data "..."
+```
+
+and:
+
+```text
+resource "..."
+```
+
+A Terraform data source reads an existing object.
+
+A Terraform resource is part of Terraform's managed lifecycle.
+
+---
+
+## Destroy the Terraform Workload
+
+Run:
+
+```bash
+terraform destroy
+```
+
+After reviewing the plan, approve with:
+
+```text
+yes
+```
+
+Observed:
+
+```text
+Destroy complete! Resources: 11 destroyed.
+```
+
+After destruction:
+
+```bash
+terraform state list
+```
+
+returned no resources.
+
+The Terraform-created network:
+
+```text
+tf-private
+```
+
+was gone.
+
+The original manually-created networks remained:
+
+```text
+private
+public
+```
+
+The Terraform floating IP:
+
+```text
+192.168.0.163
+```
+
+was released.
+
+The original manual VM floating IP remained:
+
+```text
+192.168.0.164
+```
+
+This proved that Terraform removed only the infrastructure represented by
+its managed resources.
+
+---
+
+## Rebuild from the Same Terraform Configuration
+
+No Terraform configuration files were changed.
+
+Run:
+
+```bash
+terraform plan
+```
+
+Observed:
+
+```text
+Plan: 11 to add, 0 to change, 0 to destroy.
+```
+
+Terraform still used the existing shared OpenStack objects:
+
+```text
+public network
+cirros-0.6.3 image
+m1.cirros flavor
+```
+
+and planned to rebuild the complete Terraform-managed tenant workload.
+
+Apply:
+
+```bash
+terraform apply
+```
+
+Approve with:
+
+```text
+yes
+```
+
+Observed:
+
+```text
+Apply complete! Resources: 11 added, 0 changed, 0 destroyed.
+```
+
+Terraform successfully reconstructed the workload from the same `.tf` files.
+
+---
+
+## Runtime Values Changed After Rebuild
+
+The infrastructure architecture was the same, but several dynamically
+allocated values changed.
+
+First deployment:
+
+```text
+VM UUID:       7a3b97c8-25f8-4c1f-abf9-be94448fb252
+Fixed IP:      10.10.20.31
+Floating IP:   192.168.0.163
+Compute host:  node3
+Nova instance: instance-00000003
+```
+
+Rebuilt deployment:
+
+```text
+VM UUID:       f986eaf6-254c-44b9-a6dc-4ca512f3657f
+Fixed IP:      10.10.20.245
+Floating IP:   192.168.0.150
+Compute host:  node3
+Nova instance: instance-00000006
+```
+
+The rebuilt Neutron network also received a new UUID:
+
+```text
+45cf5658-3ca8-4361-901e-4109114c77f1
+```
+
+and the rebuilt VM Neutron port became:
+
+```text
+b5a8f9ff-6afc-49c4-8968-2c019d74e361
+```
+
+This is expected.
+
+Terraform describes the desired infrastructure architecture.
+
+OpenStack may dynamically assign new:
+
+```text
+UUIDs
+fixed IP addresses
+floating IP addresses
+Neutron ports
+VXLAN segmentation IDs
+Nova instance numbers
+compute hosts
+```
+
+when infrastructure is recreated.
+
+The important point is not that every generated value remains identical.
+
+The important point is that the intended infrastructure is reconstructed
+correctly.
+
+---
+
+## Verify the Rebuilt VM
+
+Terraform outputs:
+
+```text
+public_network_id = "907bac8a-183b-4675-81f0-d4c2fe91876b"
+vm_fixed_ip       = "10.10.20.245"
+vm_floating_ip    = "192.168.0.150"
+```
+
+Verify the server:
+
+```bash
+openstack server show tf-cirros-01 \
+  -c id \
+  -c status \
+  -c addresses \
+  -c OS-EXT-SRV-ATTR:host \
+  -c OS-EXT-SRV-ATTR:instance_name
+```
+
+Observed:
+
+```text
+id                            f986eaf6-254c-44b9-a6dc-4ca512f3657f
+status                        ACTIVE
+OS-EXT-SRV-ATTR:host          node3
+OS-EXT-SRV-ATTR:instance_name instance-00000006
+addresses                     tf-private=10.10.20.245, 192.168.0.150
+```
+
+SSH into the rebuilt VM:
+
+```bash
+ssh -i ~/.ssh/openstack-lab-vm cirros@192.168.0.150
+```
+
+Verify:
+
+```bash
+hostname
+```
+
+Observed:
+
+```text
+tf-cirros-01
+```
+
+Guest interface:
+
+```text
+eth0
+IP:  10.10.20.245/24
+MAC: fa:16:3e:48:95:ee
+MTU: 1450
+```
+
+Guest routing:
+
+```text
+default via 10.10.20.1 dev eth0
+10.10.20.0/24 dev eth0
+169.254.169.254 via 10.10.20.2 dev eth0
+```
+
+Test the Neutron router:
+
+```bash
+ping -c 3 10.10.20.1
+```
+
+Observed:
+
+```text
+3 packets transmitted
+3 packets received
+0% packet loss
+```
+
+Test Internet connectivity:
+
+```bash
+ping -c 3 1.1.1.1
+```
+
+Observed:
+
+```text
+3 packets transmitted
+3 packets received
+0% packet loss
+```
+
+The rebuilt workload therefore passed the same functional tests as the
+original deployment.
+
+---
+
+## The Important Terraform Lesson
+
+Before Terraform:
+
+```text
+Infrastructure itself is the thing that must be carefully preserved.
+```
+
+With Infrastructure as Code:
+
+```text
+Terraform configuration
+        |
+        v
+Desired infrastructure
+        |
+        v
+terraform apply
+        |
+        v
+OpenStack resources
+```
+
+The individual VM, network UUID, floating IP, or Neutron port is not the
+source of truth.
+
+The Terraform configuration describes the desired infrastructure.
+
+Terraform state records the relationship between that configuration and
+the currently deployed OpenStack resources.
+
+This lab demonstrated the full lifecycle:
+
+```text
+WRITE
+  |
+  v
+PLAN
+  |
+  v
+APPLY
+  |
+  v
+VERIFY
+  |
+  v
+DESTROY
+  |
+  v
+REBUILD
+  |
+  v
+VERIFY AGAIN
+```
+
+The first Terraform OpenStack workload is now proven reproducible.
