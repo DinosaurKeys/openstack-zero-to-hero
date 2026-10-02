@@ -12,12 +12,30 @@ admin-openrc.sh
 clouds.yaml
 passwords.yml
 
-# Terraform runtime/state
+# Terraform working directory
 .terraform/
+**/.terraform/
+
+# Terraform state
 *.tfstate
 *.tfstate.*
-terraform.tfvars
+
+# Terraform plan files
+*.tfplan
+
+# Sensitive Terraform variable files
+*.tfvars
+*.tfvars.json
+
+# Terraform crash logs
 crash.log
+crash.*.log
+
+# Terraform override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
 
 # Python
 __pycache__/
