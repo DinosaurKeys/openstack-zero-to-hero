@@ -56,6 +56,49 @@ openstack token issue \
   -c expires
 ```
 
+The two `export` commands above are shell-session variables.
+
+Without making them persistent, a new login or reboot can leave these blank:
+
+```bash
+echo "$OS_CLIENT_CONFIG_FILE"
+echo "$OS_CLOUD"
+```
+
+For this lab they were made persistent on Hermes by adding the following
+to `~/.bashrc`:
+
+```bash
+export OS_CLIENT_CONFIG_FILE=/etc/kolla/clouds.yaml
+export OS_CLOUD=kolla-admin
+```
+
+Reload the shell configuration:
+
+```bash
+source ~/.bashrc
+```
+
+Verify:
+
+```bash
+echo "$OS_CLIENT_CONFIG_FILE"
+echo "$OS_CLOUD"
+```
+
+Expected:
+
+```text
+/etc/kolla/clouds.yaml
+kolla-admin
+```
+
+These settings are required on Hermes, where the OpenStack CLI and
+Terraform are run.
+
+They are not required as interactive shell exports on node1, node2, or
+node3.
+
 ---
 
 # 3. Check Existing Resources
@@ -543,7 +586,7 @@ Neutron performs NAT between them.
 
 ---
 
-# 14. Current Build Status
+# 14. Checkpoint at This Stage
 
 Completed:
 
@@ -646,7 +689,7 @@ cd ~/git/openstack-zero-to-hero
 
 ---
 
-# 16. Next Step
+# 16. Next Step at This Stage
 
 Next objects to create:
 
@@ -739,7 +782,27 @@ by the VM is automatically allowed.
 
 This lab uses a dedicated SSH keypair for OpenStack virtual machines.
 
-Local files on Hermes:
+Do not confuse this key with the SSH key used by Hermes to log in to the
+physical OpenStack nodes as the Linux user `openstack`.
+
+The two purposes are different:
+
+```text
+Hermes
+   |
+   | host administration SSH key
+   v
+node1 / node2 / node3
+
+
+Hermes
+   |
+   | openstack-lab-vm private key
+   v
+OpenStack guest VM
+```
+
+The dedicated VM key files on Hermes are:
 
 ```text
 ~/.ssh/openstack-lab-vm
@@ -749,51 +812,138 @@ Local files on Hermes:
     PUBLIC KEY
 ```
 
-The private key stays on Hermes.
+The private key must stay on Hermes.
 
-The public key is registered in OpenStack as:
-
-```text
-lab-key
-```
-
-Verify the OpenStack keypair:
+## Check Whether the VM Key Already Exists
 
 ```bash
-openstack keypair list
+ls -l \
+  ~/.ssh/openstack-lab-vm \
+  ~/.ssh/openstack-lab-vm.pub
 ```
 
-Verify the local public-key fingerprint:
+If both files already exist, do not regenerate them.
+
+If the files do not exist, create the dedicated VM keypair:
+
+```bash
+ssh-keygen \
+  -t ed25519 \
+  -f ~/.ssh/openstack-lab-vm \
+  -N '' \
+  -C 'openstack-lab-vm'
+```
+
+This creates:
+
+```text
+~/.ssh/openstack-lab-vm
+    private key
+
+~/.ssh/openstack-lab-vm.pub
+    public key
+```
+
+The public key is safe to inspect:
+
+```bash
+cat ~/.ssh/openstack-lab-vm.pub
+```
+
+Do not display or copy the private key:
+
+```text
+~/.ssh/openstack-lab-vm
+```
+
+## Check the Local Public-Key Fingerprint
 
 ```bash
 ssh-keygen -E md5 -lf ~/.ssh/openstack-lab-vm.pub
 ```
 
-Expected fingerprint in this lab:
+Observed fingerprint in this lab:
 
 ```text
 52:5a:cc:02:b3:89:58:47:62:23:50:5c:95:a1:e6:dd
 ```
 
-The fingerprint should match the `lab-key` fingerprint shown by:
+## Register the Public Key in OpenStack
+
+First check whether the OpenStack keypair already exists:
 
 ```bash
 openstack keypair list
 ```
 
-Do not recreate the keypair if it already exists and the fingerprint matches.
+The OpenStack keypair name used by the manually created workload is:
 
-When a VM is created with:
+```text
+lab-key
+```
+
+If `lab-key` does not exist, register the existing public key:
+
+```bash
+openstack keypair create \
+  --public-key ~/.ssh/openstack-lab-vm.pub \
+  lab-key
+```
+
+Verify:
+
+```bash
+openstack keypair show lab-key
+```
+
+The OpenStack keypair fingerprint must match the fingerprint of:
+
+```text
+~/.ssh/openstack-lab-vm.pub
+```
+
+Do not recreate the OpenStack keypair if it already exists and the
+fingerprint matches.
+
+## How the Key Is Used
+
+When the VM is created with:
 
 ```text
 --key-name lab-key
 ```
 
-OpenStack injects the public key into the guest so that the matching
-private key on Hermes can be used for SSH access.
+Nova associates the OpenStack keypair with the instance.
 
+The guest receives the public key.
 
----
+The matching private key stays only on Hermes.
+
+The authentication path is:
+
+```text
+Hermes
+  |
+  | ~/.ssh/openstack-lab-vm
+  | PRIVATE KEY
+  v
+SSH
+  |
+  v
+cirros-01
+  |
+  | matching PUBLIC KEY
+  v
+login allowed
+```
+
+Later the VM can be accessed with:
+
+```bash
+ssh \
+  -i ~/.ssh/openstack-lab-vm \
+  cirros@<FLOATING-IP>
+```
 
 # 19. Boot the First VM
 
@@ -1323,9 +1473,17 @@ openstack security group rule create \
   lab-sg
 ```
 
-## Create VM SSH key
+## Create or Reuse the VM SSH Key
 
-Only create a new key if it does not already exist.
+First check whether the local VM key already exists:
+
+```bash
+ls -l \
+  ~/.ssh/openstack-lab-vm \
+  ~/.ssh/openstack-lab-vm.pub
+```
+
+If the files do not exist, create them:
 
 ```bash
 ssh-keygen \
@@ -1335,13 +1493,34 @@ ssh-keygen \
   -C 'openstack-lab-vm'
 ```
 
-Register its public key:
+Check the local public-key fingerprint:
+
+```bash
+ssh-keygen -E md5 -lf ~/.ssh/openstack-lab-vm.pub
+```
+
+Check whether `lab-key` already exists in OpenStack:
+
+```bash
+openstack keypair list
+```
+
+Only if `lab-key` is missing, register the public key:
 
 ```bash
 openstack keypair create \
   --public-key ~/.ssh/openstack-lab-vm.pub \
   lab-key
 ```
+
+Verify:
+
+```bash
+openstack keypair show lab-key
+```
+
+The local public-key fingerprint and OpenStack keypair fingerprint must
+match.
 
 ## Boot VM
 
@@ -1408,3 +1587,71 @@ If all tests pass:
 FIRST OPENSTACK WORKLOAD: SUCCESS
 ```
 
+
+
+---
+
+# 28. Chapter 08 vs Chapter 10
+
+Chapter 08 creates the first workload manually with the OpenStack CLI.
+
+Chapter 10 rebuilds the same concepts using Terraform.
+
+The important relationship is:
+
+```text
+Chapter 08
+manual OpenStack CLI
+        |
+        v
+understand each OpenStack object
+        |
+        v
+Chapter 10
+Terraform Infrastructure as Code
+```
+
+Chapter 10 now automates the same workload end to end:
+
+| OpenStack Concept | Chapter 08 Manual Method | Chapter 10 Terraform |
+| --- | --- | --- |
+| Public network | `openstack network create public ...` | Existing infrastructure read with `data.openstack_networking_network_v2.public` |
+| Private network | `openstack network create private` | `openstack_networking_network_v2.private` |
+| Private subnet | `openstack subnet create private-subnet ...` | `openstack_networking_subnet_v2.private` |
+| Router | `openstack router create lab-router` | `openstack_networking_router_v2.router` |
+| Router interface | `openstack router add subnet ...` | `openstack_networking_router_interface_v2.private` |
+| Security group | `openstack security group create lab-sg` | `openstack_networking_secgroup_v2.vm` |
+| ICMP rule | `openstack security group rule create --protocol icmp ...` | `openstack_networking_secgroup_rule_v2.icmp` |
+| SSH rule | `openstack security group rule create --protocol tcp --dst-port 22 ...` | `openstack_networking_secgroup_rule_v2.ssh` |
+| VM SSH public key | `openstack keypair create --public-key ... lab-key` | `openstack_compute_keypair_v2.vm` |
+| VM | `openstack server create ...` | `openstack_compute_instance_v2.vm` |
+| Floating IP | `openstack floating ip create public` | `openstack_networking_floatingip_v2.vm` + `openstack_networking_floatingip_associate_v2.vm` |
+
+One important architectural difference is intentional.
+
+Chapter 08 manually created the shared `public` provider network.
+
+Chapter 10 does not recreate it.
+
+Terraform reads it as existing infrastructure:
+
+```hcl
+data "openstack_networking_network_v2" "public" {
+  name = "public"
+}
+```
+
+This lets Terraform build a separate tenant workload without taking
+ownership of the shared external network.
+
+A useful Terraform mental model is:
+
+```text
+variable = INPUT
+
+data = LOOK UP existing infrastructure
+
+resource = CREATE / MANAGE infrastructure
+
+output = RETURN useful information
+```
