@@ -33,4 +33,10 @@ resource "openstack_compute_instance_v2" "vm2" {
   network {
     uuid = openstack_networking_network_v2.private.id
   }
+
+  metadata = {
+    environment = "ai-lab"
+    managed_by  = "hermes-iac"
+    purpose     = "terraform-learning"
+  }
 }
