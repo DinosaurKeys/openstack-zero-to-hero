@@ -80,7 +80,7 @@ ssh_node() {
 
   local ip="${IP_BY_NODE[$node]}"
 
-  ssh \
+  ssh -n \
     -o BatchMode=yes \
     -o ConnectTimeout=5 \
     -o LogLevel=ERROR \
