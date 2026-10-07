@@ -1025,22 +1025,7 @@ Rules:
 
 ---
 
-# 22. Future automation
-
-python3 - <<'PY'
-from pathlib import Path
-
-path = Path("docs/openstack-reboot-and-recovery-runbook.md")
-text = path.read_text()
-
-marker = "# 22. Future automation"
-
-if marker not in text:
-    raise SystemExit("ERROR: Section 22 marker not found")
-
-head = text.split(marker, 1)[0]
-
-new_tail = r'''# 22. Current recovery helper scripts
+# 22. Current recovery helper scripts
 
 The helper scripts are now implemented:
 
