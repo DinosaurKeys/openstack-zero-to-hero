@@ -1,8 +1,24 @@
 # OpenStack Single-NIC Networking
 
+> **Learning stage — original lab architecture**
+>
+> This chapter documents the original single-NIC design used during the
+> first OpenStack deployment.
+>
+> It is intentionally preserved because it is a useful exercise for
+> understanding Linux bridges, veth pairs, Netplan, Open vSwitch, and
+> Neutron external networking when only one physical NIC is available.
+>
+> The lab was later upgraded to a dedicated second NIC for Neutron
+> external/provider traffic.
+>
+> The current architecture is documented in:
+>
+> `docs/17-openstack-dual-nic-networking.md`
+
 This document explains the temporary single-NIC network architecture used by the OpenStack homelab.
 
-The three OpenStack nodes currently have only one physical Ethernet interface each.
+At this stage of the lab, the three OpenStack nodes had only one physical Ethernet interface each.
 
 The goal is to allow the same physical NIC to carry:
 
@@ -16,7 +32,7 @@ without giving the physical management NIC directly to Open vSwitch.
 
 # 1. Nodes
 
-Current management addresses:
+Management addresses used during this stage:
 
 | Node | Management IP |
 |---|---|
@@ -264,9 +280,9 @@ is intentionally left free for Open vSwitch.
 
 ---
 
-# 8. Current Architecture
+# 8. Single-NIC Architecture
 
-The complete current design is:
+The complete single-NIC design is:
 
 ```text
                      HOME LAN
@@ -296,9 +312,9 @@ node3 br-mgmt = 192.168.0.202/24
 
 ---
 
-# 9. Future OpenStack Architecture
+# 9. Single-NIC OpenStack Architecture
 
-After Open vSwitch and Neutron are deployed, the intended path is:
+With Open vSwitch and Neutron deployed, the single-NIC path was:
 
 ```text
                      HOME LAN
@@ -321,7 +337,7 @@ management IP              veth-host
                          OpenStack VM
 ```
 
-The important interface for Neutron will be:
+The important external interface for Neutron was:
 
 ```text
 veth-ovs
@@ -953,13 +969,13 @@ Do not confuse Hermes networking with the OpenStack physical-node network:
 
 ---
 
-# 30. Future Two-NIC Design
+# 30. Later Two-NIC Upgrade
 
 USB Ethernet adapters have been ordered for the OpenStack nodes.
 
 Once installed, the architecture can be simplified.
 
-Current temporary design:
+Original temporary design:
 
 ```text
                enp0s31f6
@@ -971,7 +987,7 @@ management IP          veth pair
                         br-ex
 ```
 
-Future design:
+Later dual-NIC design:
 
 ```text
 enp0s31f6                      USB Ethernet
@@ -992,9 +1008,9 @@ The single-NIC work is still valuable because it demonstrates how Linux bridges,
 
 ---
 
-# 31. Planned Kolla-Ansible Mapping
+# 31. Single-NIC Kolla-Ansible Mapping
 
-For the current single-NIC architecture, the intended Kolla concepts are:
+For this single-NIC stage, the Kolla-Ansible mapping was:
 
 ```yaml
 network_interface: "br-mgmt"
@@ -1015,13 +1031,13 @@ And:
 veth-ovs
 ```
 
-will be used as the external Neutron-facing interface.
+was used as the external Neutron-facing interface.
 
 We will validate the final Kolla configuration again before deployment rather than blindly copying historical configuration.
 
 ---
 
-# 32. Current Network Summary
+# 32. Single-NIC Network Summary
 
 Each node now has:
 
@@ -1037,7 +1053,7 @@ veth-host
    ||
 veth-ovs
    |
-future br-ex
+br-ex
    |
 Neutron
 ```
@@ -1065,10 +1081,10 @@ Gateway:
 3. Physical NICs can operate as Layer-2 bridge ports.
 4. A veth pair behaves like a virtual Ethernet cable.
 5. `veth-host` connects the physical LAN side to the bridge.
-6. `veth-ovs` provides a future attachment point for Open vSwitch.
+6. `veth-ovs` provides the attachment point for Open vSwitch.
 7. Test management networking on one server before automating the cluster.
 8. `netplan generate` and `netplan try` serve different purposes.
 9. Always test SSH before accepting a remote networking change.
 10. Always verify `hostname` before modifying network configuration.
-11. The single-NIC design is temporary but provides valuable Linux networking experience.
-12. A dedicated second NIC will simplify the eventual Neutron architecture.
+11. The single-NIC design was temporary but provides valuable Linux networking experience.
+12. A dedicated second NIC later simplified the Neutron external network architecture.
