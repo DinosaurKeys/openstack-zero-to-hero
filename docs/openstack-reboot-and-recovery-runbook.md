@@ -1325,8 +1325,122 @@ PASS checks: 14
 ```
 
 ---
+# 24. RabbitMQ / Nova RPC last-resort recovery
 
-# 24. Preferred operating rule
+A separate failure was observed where MariaDB and the main control plane
+had recovered, but the Nova compute services still could not communicate
+correctly with Nova conductor through RabbitMQ.
+
+This is NOT the normal cold-boot recovery procedure.
+
+Observed symptoms included:
+
+```text
+nova_compute containers healthy
+nova-compute service State = down
+nova-conductor running
+repeated conductor RPC timeouts
+MessageUndeliverable errors
+missing or stale nova-compute reply queues
+```
+
+Normal service restarts did not repair the condition.
+
+The recovery used was:
+
+```text
+stop Nova and Neutron cleanly
+        ↓
+reset RabbitMQ application state
+        ↓
+redeploy Nova and Neutron
+        ↓
+verify Nova computes and Neutron agents
+```
+
+First stop Nova and Neutron:
+
+```bash
+kolla-ansible stop \
+  -i kolla/inventory/multinode \
+  --tags nova,neutron \
+  --yes-i-really-really-mean-it
+```
+
+Then reset RabbitMQ state:
+
+```bash
+kolla-ansible rabbitmq-reset-state \
+  -i kolla/inventory/multinode
+```
+
+Then reconcile and redeploy Nova and Neutron:
+
+```bash
+kolla-ansible deploy \
+  -i kolla/inventory/multinode \
+  --tags nova,neutron
+```
+
+After recovery, verify:
+
+```bash
+./scripts/lab-status.sh
+```
+
+The successful result observed in this lab was:
+
+```text
+Nova compute services: 3/3 enabled and up
+Hypervisors:           3/3 up
+Neutron agents:        12/12 alive and UP
+
+RESULT: HEALTHY
+PASS checks: 14
+```
+
+## Important safety rule
+
+`rabbitmq-reset-state` is a LAST-RESORT repair.
+
+It must NOT be added as an automatic action to:
+
+```text
+scripts/lab-recover.sh
+```
+
+The normal recovery path remains:
+
+```text
+MariaDB
+   ↓
+ProxySQL
+   ↓
+Placement
+   ↓
+Nova / Neutron control plane
+   ↓
+Nova compute
+```
+
+Only consider resetting RabbitMQ state when:
+
+```text
+MariaDB is healthy
+RabbitMQ containers are running
+control services have been recovered
+normal targeted restarts have failed
+Nova RPC communication is still broken
+RabbitMQ queue/RPC state has been diagnosed as the problem
+```
+
+This procedure does not reinstall OpenStack.
+
+It resets RabbitMQ application state and then reconciles the Nova and
+Neutron services against the existing Kolla-Ansible configuration.
+
+---
+# 25. Preferred operating rule
 
 For normal maintenance:
 
