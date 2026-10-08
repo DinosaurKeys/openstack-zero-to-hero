@@ -4,6 +4,14 @@ This document is a reusable reference for safely inspecting and changing network
 
 It is intentionally separate from the OpenStack-specific networking configuration.
 
+Sections 13-15 preserve the original single-NIC OpenStack networking stage as a learning exercise.
+
+The current dual-NIC OpenStack architecture is summarized at the end of this chapter and documented in detail in:
+
+```text
+docs/17-openstack-dual-nic-networking.md
+```
+
 ---
 
 # 1. Safety First - Confirm the Server
@@ -520,9 +528,9 @@ sudo netplan generate
 
 ---
 
-# 13. Our OpenStack Lab Is Different
+# 13. Historical OpenStack Single-NIC Stage
 
-Changing the IP of a normal Ubuntu VM is simpler than the networking used in our OpenStack lab.
+Changing the IP of a normal Ubuntu VM is simpler than the networking used during the original single-NIC stage of this OpenStack lab.
 
 ## Normal Ubuntu VM
 
@@ -535,9 +543,9 @@ enp0s31f6
 
 The NIC owns the IP address directly.
 
-## Our Single-NIC OpenStack Node
+## Original Single-NIC OpenStack Node
 
-Our OpenStack node currently looks like:
+During the original build, the OpenStack node looked like:
 
 ```text
                 192.168.0.200
@@ -557,7 +565,7 @@ Here:
 enp0s31f6
 ```
 
-does NOT own the management IP.
+did NOT own the management IP directly.
 
 Instead:
 
@@ -565,21 +573,23 @@ Instead:
 br-mgmt
 ```
 
-owns:
+owned:
 
 ```text
 192.168.0.200/24
 ```
 
-The physical NIC is a Layer-2 member of the Linux bridge.
+The physical NIC was a Layer-2 member of the Linux bridge.
+
+This design is preserved because it is useful for understanding Linux bridges, veth pairs, and how a single physical interface can be shared between different networking roles.
 
 ---
 
-# 14. Why OpenStack Uses the Bridge and veth Pair
+# 14. Why the Original Lab Used the Bridge and veth Pair
 
-We currently have only one physical Ethernet interface.
+At this stage of the original build, each node had only one physical Ethernet interface available for OpenStack networking.
 
-That physical NIC must temporarily carry both:
+That physical NIC had to carry both:
 
 ```text
 OpenStack management traffic
@@ -587,7 +597,7 @@ OpenStack management traffic
 Neutron external-network traffic
 ```
 
-The Linux bridge allows Ubuntu to retain management connectivity.
+The Linux bridge allowed Ubuntu to retain management connectivity.
 
 The veth pair:
 
@@ -595,9 +605,9 @@ The veth pair:
 veth-host <========> veth-ovs
 ```
 
-acts like a virtual Ethernet cable.
+acted like a virtual Ethernet cable.
 
-Current design:
+Historical design:
 
 ```text
 Home LAN
@@ -612,7 +622,7 @@ veth-host
 veth-ovs
 ```
 
-Later OpenStack/Open vSwitch will use:
+When OpenStack was deployed, Open vSwitch used:
 
 ```text
 veth-ovs
@@ -622,13 +632,33 @@ veth-ovs
 Neutron
 ```
 
-This is OpenStack-specific.
+The resulting historical external path was:
+
+```text
+Neutron
+   |
+ br-ex
+   |
+veth-ovs
+   ||
+veth-host
+   |
+br-mgmt
+   |
+enp0s31f6
+   |
+physical LAN
+```
+
+This was an OpenStack-specific workaround for the single-NIC stage.
 
 You do NOT need this architecture simply to change the IP of a normal Ubuntu VM.
 
 ---
 
-# 15. Bridge Verification Commands
+# 15. Historical Bridge Verification Commands
+
+During the single-NIC stage, useful commands included the following.
 
 Show Linux bridge ports:
 
@@ -636,7 +666,7 @@ Show Linux bridge ports:
 bridge link
 ```
 
-Example:
+Historical example:
 
 ```text
 enp0s31f6 ... master br-mgmt
@@ -672,6 +702,12 @@ veth-ovs@veth-host
 ```
 
 shows that the interfaces are paired.
+
+These commands remain useful for understanding the historical design documented in:
+
+```text
+docs/03-openstack-single-nic-networking.md
+```
 
 ---
 
@@ -743,5 +779,74 @@ ping -c 3 google.com
 6. `netplan try` is safer than blindly using `netplan apply`.
 7. Verify gateway, Internet routing, DNS, and SSH separately.
 8. A normal Ubuntu static IP does not require a bridge.
-9. Our bridge and veth pair exist because of the single-NIC OpenStack design.
+9. The historical bridge and `veth-host` / `veth-ovs` pair existed because the original OpenStack design had only one physical NIC available for both management and Neutron external traffic.
 10. Never assume that because a YAML file looks valid, remote connectivity will survive the change.
+
+---
+
+# 18. Current OpenStack Dual-NIC Design
+
+The lab later moved away from the single-NIC workaround.
+
+The current management path is:
+
+```text
+enp0s31f6
+     |
+  br-mgmt
+     |
+node management IP
+OpenStack API/control traffic
+VXLAN underlay traffic
+```
+
+The current Neutron external/provider path is separate:
+
+```text
+Neutron
+   |
+ br-ex
+   |
+ ext0
+   |
+physical LAN
+```
+
+Kolla-Ansible currently uses:
+
+```yaml
+network_interface: "br-mgmt"
+neutron_external_interface: "ext0"
+```
+
+The important distinction is:
+
+```text
+enp0s31f6 / br-mgmt
+    management + API + VXLAN underlay
+
+ext0 / br-ex
+    Neutron external/provider traffic
+```
+
+The full migration and current implementation are documented in:
+
+```text
+docs/17-openstack-dual-nic-networking.md
+```
+
+The original single-NIC implementation remains documented in:
+
+```text
+docs/03-openstack-single-nic-networking.md
+```
+
+Both are useful:
+
+```text
+Chapter 03
+    explains how the single-NIC workaround worked
+
+Chapter 17
+    documents the current dual-NIC production state of the homelab
+```
