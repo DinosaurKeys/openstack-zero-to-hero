@@ -1,0 +1,78 @@
+---
+# Kolla-Ansible globals used by the OpenStack homelab.
+#
+# This file documents the non-secret configuration required to reproduce
+# the current three-node deployment.
+#
+# The active runtime file is:
+#
+#   /etc/kolla/globals.yml
+#
+# Do not commit:
+#
+#   /etc/kolla/passwords.yml
+#
+# because passwords.yml contains generated OpenStack service secrets.
+
+# Workaround enabled in the current deployed environment.
+workaround_ansible_issue_8743: true
+
+# Container images are based on Ubuntu.
+kolla_base_distro: "ubuntu"
+
+# Internal OpenStack API virtual IP.
+#
+# Keepalived moves this address between eligible control nodes.
+#
+# Current VIP:
+#
+#   192.168.0.100/32
+#
+kolla_internal_vip_address: "192.168.0.100"
+
+# Kolla containers run with Docker.
+kolla_container_engine: "docker"
+
+# Management / control / API / VXLAN interface.
+#
+# Physical path:
+#
+#   enp0s31f6
+#        |
+#     br-mgmt
+#
+# Node addresses:
+#
+#   node1 = 192.168.0.200/24
+#   node2 = 192.168.0.201/24
+#   node3 = 192.168.0.202/24
+#
+network_interface: "br-mgmt"
+
+# Dedicated Neutron external/provider interface.
+#
+# Physical path:
+#
+#   ext0
+#     |
+#   br-ex
+#     |
+#   Neutron external/provider network
+#
+# ext0 is a TP-Link UE306 USB Gigabit Ethernet adapter using r8152.
+# It intentionally has no IPv4 address.
+#
+neutron_external_interface: "ext0"
+
+# Heat is not currently enabled in this homelab.
+enable_heat: "no"
+
+# Use hardware virtualization through KVM.
+nova_compute_virt_type: "kvm"
+
+# RabbitMQ stream fanout is disabled in the current deployment.
+#
+# This setting is part of the validated running configuration and should
+# remain documented so a rebuild does not silently change RabbitMQ behavior.
+#
+om_enable_rabbitmq_stream_fanout: false
