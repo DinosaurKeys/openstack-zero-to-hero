@@ -234,13 +234,7 @@ From Hermes:
 
 ```bash
 ssh-copy-id openstack@192.168.0.200
-```
-
-```bash
 ssh-copy-id openstack@192.168.0.201
-```
-
-```bash
 ssh-copy-id openstack@192.168.0.202
 ```
 
@@ -250,13 +244,7 @@ After the key is installed, test:
 
 ```bash
 ssh openstack@192.168.0.200
-```
-
-```bash
 ssh openstack@192.168.0.201
-```
-
-```bash
 ssh openstack@192.168.0.202
 ```
 
@@ -372,7 +360,7 @@ Hermes
  Ansible module execution
 ```
 
-A successful Ansible ping therefore confirms several things at once:
+A successful Ansible ping therefore confirms:
 
 ```text
 SSH connectivity
@@ -384,8 +372,6 @@ Ansible execution
 ---
 
 # 12. Verify Hostnames with Ansible
-
-Run:
 
 ```bash
 ansible all \
@@ -405,8 +391,6 @@ node3 -> node3
 ---
 
 # 13. Verify Passwordless sudo with Ansible
-
-Run:
 
 ```bash
 ansible all \
@@ -603,7 +587,7 @@ dpkg -l | grep -E 'qemu-kvm|libvirt'
 
 No output was expected at this stage.
 
-We did not manually install the complete QEMU/libvirt stack because Kolla-Ansible will later manage the OpenStack compute components.
+We did not manually install the complete QEMU/libvirt stack because the next deployment stage used Kolla-Ansible to provide and manage the OpenStack compute components.
 
 ---
 
@@ -689,9 +673,9 @@ Example:
 
 ---
 
-# 21. Current Repository Structure
+# 21. Repository Structure at This Stage
 
-At this phase:
+At this point in the original build, the repository looked like:
 
 ```text
 openstack-zero-to-hero/
@@ -710,6 +694,8 @@ openstack-zero-to-hero/
     └── 03-openstack-single-nic-networking.md
 ```
 
+The repository has since expanded with Kolla-Ansible, Terraform, troubleshooting, recovery, AI-assisted IaC, and dual-NIC documentation.
+
 ---
 
 # 22. Main Lessons
@@ -727,11 +713,13 @@ openstack-zero-to-hero/
 
 ---
 
-# 23. Next Phase
+# 23. Next Phase at This Stage
 
-The next phase is OpenStack networking.
+At this point in the original build, the next phase was OpenStack networking.
 
-Because the nodes currently have only one physical Ethernet interface, the lab uses:
+The original lab still had only one physical Ethernet interface available for OpenStack networking on each node.
+
+The design therefore used:
 
 ```text
 enp0s31f6
@@ -747,8 +735,36 @@ plus:
 veth-host <========> veth-ovs
 ```
 
-This is documented separately in:
+That historical single-NIC design is documented separately in:
 
 ```text
 docs/03-openstack-single-nic-networking.md
+```
+
+The lab was later upgraded to a dedicated second NIC for Neutron external/provider traffic.
+
+The current architecture is documented in:
+
+```text
+docs/17-openstack-dual-nic-networking.md
+```
+
+Current high-level network design:
+
+```text
+enp0s31f6
+     |
+  br-mgmt
+     |
+management / API / VXLAN
+```
+
+and separately:
+
+```text
+ext0
+ |
+br-ex
+ |
+Neutron external/provider traffic
 ```
