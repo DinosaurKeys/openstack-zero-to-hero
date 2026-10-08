@@ -1,0 +1,454 @@
+---
+- name: Prepare final dual-NIC OpenStack host networking
+  hosts: openstack
+  become: true
+  gather_facts: false
+  serial: 1
+
+  # PURPOSE
+  #
+  # This playbook describes the final host-side dual-NIC network design:
+  #
+  #   enp0s31f6 -> br-mgmt -> management / API / VXLAN
+  #   ext0      -> br-ex    -> Neutron external/provider
+  #
+  # DEFAULT MODE
+  #
+  # Running the playbook normally performs validation only.
+  # It does not modify Netplan.
+  #
+  # APPLY MODE
+  #
+  # Configuration files are written only when explicitly requested:
+  #
+  #   ansible-playbook \
+  #     -i ansible/inventory.ini \
+  #     ansible/playbooks/04-dual-nic-network.yml \
+  #     --limit node1 \
+  #     -e apply_dual_nic=true
+  #
+  # Apply mode MUST target exactly one node.
+  #
+  # The playbook intentionally runs only:
+  #
+  #   netplan generate
+  #
+  # It does NOT run:
+  #
+  #   netplan apply
+  #   netplan try
+  #
+  # The operator must test the network manually afterward.
+  #
+  # IMPORTANT
+  #
+  # This playbook configures the Linux/Netplan side only.
+  #
+  # On an already deployed single-NIC OpenStack cluster, follow the live
+  # migration procedure in:
+  #
+  #   docs/17-openstack-dual-nic-networking.md
+  #
+  # so br-ex is migrated safely from veth-ovs to ext0 before removing the
+  # old veth path.
+
+  vars:
+    apply_dual_nic: false
+
+    management_interface: enp0s31f6
+    management_bridge: br-mgmt
+    management_gateway: 192.168.0.1
+
+    external_interface: ext0
+    external_driver: r8152
+
+    external_nic_mac:
+      node1: "00:e0:4c:2c:16:78"
+      node2: "00:e0:4c:30:46:88"
+      node3: "00:e0:4c:55:7e:58"
+
+  tasks:
+
+    # ------------------------------------------------------------------
+    # Safety checks
+    # ------------------------------------------------------------------
+
+    - name: Verify this host has a documented external NIC MAC
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname in external_nic_mac
+        fail_msg: >-
+          No external NIC MAC is defined for {{ inventory_hostname }}.
+          Refusing to continue.
+
+    - name: Verify ansible_host exists for this node
+      ansible.builtin.assert:
+        that:
+          - ansible_host is defined
+          - ansible_host | length > 0
+        fail_msg: >-
+          ansible_host is not defined for {{ inventory_hostname }}.
+          Refusing to generate management networking.
+
+    - name: Require exactly one target host in apply mode
+      ansible.builtin.assert:
+        that:
+          - (ansible_play_hosts_all | length) == 1
+        fail_msg: >-
+          Apply mode must target exactly one node.
+          Re-run with --limit node1, --limit node2, or --limit node3.
+      when: apply_dual_nic | bool
+
+    - name: Verify management interface exists
+      ansible.builtin.command:
+        argv:
+          - ip
+          - link
+          - show
+          - dev
+          - "{{ management_interface }}"
+      register: management_interface_state
+      changed_when: false
+
+    - name: Verify ethtool is installed
+      ansible.builtin.command:
+        argv:
+          - which
+          - ethtool
+      register: ethtool_check
+      changed_when: false
+      failed_when: false
+
+    - name: Require ethtool
+      ansible.builtin.assert:
+        that:
+          - ethtool_check.rc == 0
+        fail_msg: >-
+          ethtool is required to identify the external USB NIC safely.
+          Install ethtool before continuing.
+
+    # ------------------------------------------------------------------
+    # Discover the USB NIC safely
+    #
+    # Do NOT rely only on the interface name.
+    #
+    # Before Netplan renames the adapter it may be called enx...
+    #
+    # Also do NOT match only by MAC because br-ex may expose the same MAC.
+    #
+    # Match both:
+    #
+    #   MAC address
+    #   driver = r8152
+    # ------------------------------------------------------------------
+
+    - name: Discover external NIC by documented MAC and driver
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        target_mac="{{ external_nic_mac[inventory_hostname] | lower }}"
+        target_driver="{{ external_driver }}"
+
+        for address_file in /sys/class/net/*/address; do
+          iface="$(basename "$(dirname "${address_file}")")"
+          mac="$(tr '[:upper:]' '[:lower:]' < "${address_file}")"
+
+          if [ "${mac}" != "${target_mac}" ]; then
+            continue
+          fi
+
+          driver="$(
+            ethtool -i "${iface}" 2>/dev/null |
+            awk -F': ' '$1 == "driver" {print $2; exit}'
+          )"
+
+          if [ "${driver}" = "${target_driver}" ]; then
+            echo "${iface}"
+            exit 0
+          fi
+        done
+
+        exit 1
+      args:
+        executable: /bin/bash
+      register: discovered_external_interface
+      changed_when: false
+
+    - name: Verify external NIC was discovered
+      ansible.builtin.assert:
+        that:
+          - discovered_external_interface.stdout | trim | length > 0
+        fail_msg: >-
+          Could not find the documented external USB NIC using
+          MAC {{ external_nic_mac[inventory_hostname] }}
+          and driver {{ external_driver }}.
+
+    - name: Read discovered external NIC driver
+      ansible.builtin.command:
+        argv:
+          - ethtool
+          - -i
+          - "{{ discovered_external_interface.stdout | trim }}"
+      register: external_driver_state
+      changed_when: false
+
+    - name: Verify discovered NIC driver
+      ansible.builtin.assert:
+        that:
+          - "('driver: ' ~ external_driver) in external_driver_state.stdout"
+        fail_msg: >-
+          The discovered NIC does not use the expected
+          {{ external_driver }} driver.
+
+    - name: Display discovered NIC identity
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Management interface: {{ management_interface }}"
+          - "Management IP: {{ ansible_host }}"
+          - "External NIC discovered as: {{ discovered_external_interface.stdout | trim }}"
+          - "External NIC MAC: {{ external_nic_mac[inventory_hostname] }}"
+          - "External NIC driver: {{ external_driver }}"
+          - "Apply mode: {{ apply_dual_nic | bool }}"
+
+    # ------------------------------------------------------------------
+    # Validation-only mode
+    # ------------------------------------------------------------------
+
+    - name: Validate current final dual-NIC state
+      when: not (apply_dual_nic | bool)
+      block:
+
+        - name: Read management bridge state
+          ansible.builtin.command:
+            argv:
+              - ip
+              - -br
+              - addr
+              - show
+              - "{{ management_bridge }}"
+          register: management_bridge_state
+          changed_when: false
+          failed_when: false
+
+        - name: Read management interface bridge membership
+          ansible.builtin.command:
+            argv:
+              - bridge
+              - link
+              - show
+              - dev
+              - "{{ management_interface }}"
+          register: management_bridge_membership
+          changed_when: false
+          failed_when: false
+
+        - name: Read current external interface state
+          ansible.builtin.command:
+            argv:
+              - ip
+              - -br
+              - link
+              - show
+              - "{{ external_interface }}"
+          register: external_interface_state
+          changed_when: false
+          failed_when: false
+
+        - name: Check external interface IPv4 addresses
+          ansible.builtin.command:
+            argv:
+              - ip
+              - -4
+              - -o
+              - addr
+              - show
+              - dev
+              - "{{ external_interface }}"
+          register: external_ipv4_state
+          changed_when: false
+          failed_when: false
+
+        - name: Read default route
+          ansible.builtin.command:
+            argv:
+              - ip
+              - route
+              - show
+              - default
+          register: default_route_state
+          changed_when: false
+
+        - name: Check whether veth-host still exists
+          ansible.builtin.command:
+            argv:
+              - ip
+              - link
+              - show
+              - dev
+              - veth-host
+          register: veth_host_state
+          changed_when: false
+          failed_when: false
+
+        - name: Check whether veth-ovs still exists
+          ansible.builtin.command:
+            argv:
+              - ip
+              - link
+              - show
+              - dev
+              - veth-ovs
+          register: veth_ovs_state
+          changed_when: false
+          failed_when: false
+
+        - name: Verify final dual-NIC network state
+          ansible.builtin.assert:
+            that:
+              - management_bridge_state.rc == 0
+              - ansible_host in management_bridge_state.stdout
+              - management_bridge_membership.rc == 0
+              - "('master ' ~ management_bridge) in management_bridge_membership.stdout"
+              - (discovered_external_interface.stdout | trim) == external_interface
+              - external_interface_state.rc == 0
+              - external_ipv4_state.rc == 0
+              - external_ipv4_state.stdout | trim == ''
+              - "('default via ' ~ management_gateway ~ ' dev ' ~ management_bridge) in default_route_state.stdout"
+              - veth_host_state.rc != 0
+              - veth_ovs_state.rc != 0
+            fail_msg: >-
+              {{ inventory_hostname }} does not match the documented final
+              dual-NIC state. Review the task output before making changes.
+
+        - name: Report successful validation
+          ansible.builtin.debug:
+            msg:
+              - "{{ inventory_hostname }} dual-NIC validation PASSED."
+              - "{{ management_bridge_state.stdout }}"
+              - "{{ external_interface_state.stdout }}"
+              - "External NIC has no IPv4 address."
+              - "Default route uses {{ management_bridge }}."
+              - "Old veth-host / veth-ovs pair is absent."
+
+    # ------------------------------------------------------------------
+    # Apply mode
+    #
+    # Writes configuration only.
+    # Does not activate it.
+    # ------------------------------------------------------------------
+
+    - name: Write final dual-NIC Netplan configuration
+      when: apply_dual_nic | bool
+      block:
+
+        - name: Check for existing management Netplan
+          ansible.builtin.stat:
+            path: /etc/netplan/50-cloud-init.yaml
+          register: management_netplan_file
+
+        - name: Check for existing external Netplan
+          ansible.builtin.stat:
+            path: /etc/netplan/60-neutron-external.yaml
+          register: external_netplan_file
+
+        - name: Back up existing management Netplan
+          ansible.builtin.copy:
+            src: /etc/netplan/50-cloud-init.yaml
+            dest: /etc/netplan/50-cloud-init.yaml.pre-dual-nic
+            remote_src: true
+            force: false
+            owner: root
+            group: root
+            mode: "0600"
+          when: management_netplan_file.stat.exists
+
+        - name: Back up existing external Netplan
+          ansible.builtin.copy:
+            src: /etc/netplan/60-neutron-external.yaml
+            dest: /etc/netplan/60-neutron-external.yaml.pre-dual-nic
+            remote_src: true
+            force: false
+            owner: root
+            group: root
+            mode: "0600"
+          when: external_netplan_file.stat.exists
+
+        - name: Disable cloud-init network regeneration
+          ansible.builtin.copy:
+            dest: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+            content: |
+              network: {config: disabled}
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Write final management Netplan
+          ansible.builtin.copy:
+            dest: /etc/netplan/50-cloud-init.yaml
+            owner: root
+            group: root
+            mode: "0600"
+            content: |
+              network:
+                version: 2
+                renderer: networkd
+
+                ethernets:
+                  {{ management_interface }}:
+                    dhcp4: false
+                    dhcp6: false
+
+                bridges:
+                  {{ management_bridge }}:
+                    interfaces:
+                      - {{ management_interface }}
+                    addresses:
+                      - {{ ansible_host }}/24
+                    routes:
+                      - to: default
+                        via: {{ management_gateway }}
+                    nameservers:
+                      addresses:
+                        - 192.168.0.1
+                        - 1.1.1.1
+
+        - name: Write final Neutron external Netplan
+          ansible.builtin.copy:
+            dest: /etc/netplan/60-neutron-external.yaml
+            owner: root
+            group: root
+            mode: "0600"
+            content: |
+              network:
+                version: 2
+                renderer: networkd
+
+                ethernets:
+                  neutron-external:
+                    match:
+                      macaddress: "{{ external_nic_mac[inventory_hostname] }}"
+                      driver: {{ external_driver }}
+                    set-name: {{ external_interface }}
+                    dhcp4: false
+                    dhcp6: false
+                    accept-ra: false
+                    link-local: []
+                    optional: true
+
+        - name: Validate generated Netplan configuration
+          ansible.builtin.command:
+            argv:
+              - netplan
+              - generate
+          changed_when: false
+
+        - name: Stop before activating networking
+          ansible.builtin.debug:
+            msg:
+              - "Netplan files were written successfully."
+              - "netplan generate PASSED."
+              - "Networking was NOT activated."
+              - "Review the files before continuing."
+              - "Then test manually with: sudo netplan try --timeout 30"
+              - "Confirm SSH connectivity before accepting the Netplan change."
