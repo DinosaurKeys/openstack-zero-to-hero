@@ -1,88 +1,136 @@
-# OpenStack Architecture 101
-
-This page is a review guide for the core OpenStack services used in this homelab.
-
-The goal is **not** to memorize every daemon.
-
-The goal is to understand the few core responsibilities well enough that Kolla-Ansible container names and deployment logs stop looking random.
-
----
-
-# 1. The Small Mental Model
-
+OpenStack Architecture 101
+This chapter is a review guide for the core OpenStack services used in this homelab.
+The goal is not to memorize every daemon or container.
+The goal is to understand the main responsibilities well enough that:
+Kolla-Ansible container names
+OpenStack CLI output
+Terraform resources
+Neutron networking
+troubleshooting logs
+stop looking like unrelated pieces.
+This chapter describes the current deployed lab.
+Historical single-NIC networking is preserved separately in:
+docs/03-openstack-single-nic-networking.md
+The current dual-NIC implementation is documented in:
+docs/17-openstack-dual-nic-networking.md
+1. The Small Mental Model
 Start with this:
+Keystone   = WHO
+Nova       = VM
+Placement  = WHERE
+Glance     = IMAGE
+Neutron    = NETWORK
 
-```text
-Keystone  = WHO
-Nova      = VM
-Placement = WHERE
-Glance    = IMAGE
-Neutron   = NETWORK
+MariaDB    = REMEMBER
+RabbitMQ   = TALK
 
-MariaDB   = REMEMBER
-RabbitMQ  = TALK
+HAProxy    = LOAD BALANCE
+Keepalived = VIP
+ProxySQL   = DATABASE PROXY
 
 libvirt + QEMU + KVM = RUN
-```
-
-If this picture is clear, the rest of OpenStack becomes much easier to learn.
-
----
-
-# 2. OpenStack Is a Collection of Services
-
+If this picture is clear, the rest of OpenStack becomes much easier to reason about.
+2. OpenStack Is a Collection of Services
 OpenStack is not one monolithic application.
-
 It is a collection of cooperating services:
-
-```text
-                 User / Terraform / Horizon
-                          |
-                          v
-                     Keystone
-                  Authentication
-                          |
-            +-------------+-------------+
-            |             |             |
-            v             v             v
-          Nova          Glance        Neutron
-         Compute        Images        Network
-            |
-       Placement
-            |
-      nova-compute
-            |
-     libvirt/QEMU/KVM
-            |
-            VM
-```
-
-This is one of the biggest mental shifts coming from VMware.
-
+                User / Terraform / Horizon
+                         |
+                         v
+                    Keystone
+                 Authentication
+                         |
+           +-------------+-------------+
+           |             |             |
+           v             v             v
+         Nova          Glance        Neutron
+        Compute        Images        Network
+           |
+      Placement
+           |
+     nova-compute
+           |
+    libvirt/QEMU/KVM
+           |
+           v
+           VM
+Coming from VMware, this is one of the biggest mental shifts.
 A VMware environment often feels unified through vCenter.
-
 OpenStack exposes more of the individual infrastructure services.
-
----
-
-# 3. Keystone — WHO Are You?
-
+3. Current Homelab Layout
+The current lab contains:
+node1 = 192.168.0.200
+node2 = 192.168.0.201
+node3 = 192.168.0.202
+All three nodes are converged:
+control
+network
+compute
+Hermes is the administration and automation machine.
+Hermes
+  |
+  +-- Ansible
+  +-- Kolla-Ansible
+  +-- OpenStack CLI
+  +-- Terraform
+  +-- Git
+The OpenStack internal API VIP is:
+192.168.0.100
+4. Current Network Architecture
+Each node uses two physical networking roles.
+Management / control / VXLAN side
+br-mgmt
+   |
+enp0s31f6
+   |
+physical LAN
+Management addresses:
+node1 = 192.168.0.200/24
+node2 = 192.168.0.201/24
+node3 = 192.168.0.202/24
+The API VIP:
+192.168.0.100/32
+is hosted on br-mgmt by the active Keepalived owner.
+Neutron external/provider side
+br-ex
+  |
+ext0
+  |
+physical LAN
+ext0 is the dedicated USB Ethernet adapter used by Neutron as the external/provider uplink.
+Kolla uses:
+network_interface: "br-mgmt"
+neutron_external_interface: "ext0"
+The old single-NIC veth design is no longer the current packet path.
+5. Why the Dual-NIC Split Matters
+The two network roles are easier to understand when separated.
+NIC 1
+enp0s31f6
+    |
+br-mgmt
+    |
+management
+OpenStack APIs
+control traffic
+VXLAN underlay
+and:
+NIC 2
+ext0
+   |
+br-ex
+   |
+Neutron external/provider traffic
+Floating IP traffic
+This avoids forcing management and external-provider connectivity through the same physical NIC.
+6. Keystone — WHO Are You?
 Keystone is the OpenStack Identity service.
-
 It deals with:
-
-```text
 users
 projects
 roles
 authentication
 tokens
 service catalog
-```
-
 Conceptually:
-
-```text
 User
  |
  | credentials
@@ -92,31 +140,36 @@ Keystone
  | token
  v
 OpenStack APIs
-```
-
 Keystone authenticates users and services.
-
-It does **not** create virtual machines.
-
-## VMware Mental Model
-
+It does not create virtual machines.
+VMware mental model
 A rough analogy is:
-
-```text
-Keystone ~ vCenter SSO / identity and RBAC concepts
-```
-
-The analogy is useful, but not exact.
-
----
-
-# 4. Nova — VM Compute Management
-
+Keystone
+    ~
+vCenter SSO / identity / RBAC concepts
+The analogy is useful but not exact.
+7. Projects, Users, and Roles
+OpenStack separates identity from ownership.
+A useful model is:
+User
+  |
+  | gets a role
+  v
+Project
+  |
+  v
+OpenStack resources
+Examples of project-owned resources:
+VMs
+networks
+routers
+security groups
+Floating IPs
+volumes
+This matters when learning Terraform because the same API may create resources in different projects depending on the selected OpenStack identity.
+8. Nova — VM Compute Management
 Nova is the OpenStack Compute service.
-
-Nova manages the lifecycle of instances:
-
-```text
+Nova manages instance lifecycle operations such as:
 create
 start
 stop
@@ -124,61 +177,32 @@ reboot
 delete
 resize
 migrate
-```
-
-Nova itself is split into several components.
-
-Important ones for this lab include:
-
-```text
+Important Nova components include:
 nova-api
 nova-scheduler
 nova-conductor
 nova-compute
-```
-
----
-
-# 5. Nova API — The Front Door
-
+Nova is not itself the hypervisor.
+9. Nova API — The Front Door
 When a user, Horizon, Terraform, or the OpenStack CLI requests a VM, the request reaches the Nova API.
-
-Example request:
-
-```text
-Create VM:
+Example:
+Create VM
 
 Name: ubuntu01
 vCPU: 2
 RAM: 4 GB
-Image: Ubuntu 24.04
+Image: Ubuntu
 Network: private-net
-```
-
 Conceptually:
-
-```text
 Terraform / CLI / Horizon
           |
           v
        Nova API
-```
-
-`nova-api` is the front door to the Nova compute service.
-
 Terraform is not bypassing OpenStack.
-
-Terraform is automating OpenStack through its APIs.
-
----
-
-# 6. Placement — WHERE Are Resources Available?
-
+Terraform automates OpenStack by calling its APIs.
+10. Placement — WHERE Are Resources Available?
 Placement tracks resource inventories and allocations.
-
 For example:
-
-```text
 node1
 ├── CPU
 ├── RAM
@@ -193,68 +217,35 @@ node3
 ├── CPU
 ├── RAM
 └── resource inventory
-```
-
-When Nova needs a host for a new VM, Placement helps identify which resource providers can satisfy the requested resources.
-
 Important distinction:
+Placement
+    provides resource inventory and allocation information
 
-```text
-Placement = resource information / candidates
-
-Scheduler = makes the placement decision
-```
-
+Nova Scheduler
+    chooses the compute host
 Placement does not simply say:
-
-```text
 Run the VM on node2.
-```
-
-Instead, it helps Nova understand what capacity is available.
-
----
-
-# 7. Nova Scheduler — Choose the Compute Host
-
-Nova Scheduler decides which compute host should run the instance.
-
+It helps Nova understand where resources are available.
+11. Nova Scheduler — Choose the Compute Host
+Nova Scheduler decides where a new instance should run.
 Conceptually:
-
-```text
 Nova API
    |
    v
 Placement
    |
-   | possible hosts
+   | candidate hosts
    v
 Nova Scheduler
    |
    | choose node2
    v
 node2
-```
-
 A rough VMware analogy is placement logic associated with scheduling or DRS.
-
-But Nova Scheduler should not be treated as a direct 1:1 equivalent of VMware DRS.
-
-The important question Nova Scheduler answers is:
-
-```text
-Where should this new VM run?
-```
-
----
-
-# 8. Nova Compute — Host-Side Compute Service
-
-Each compute host normally runs a `nova-compute` service.
-
+It is not a direct 1:1 equivalent.
+12. nova-compute — Host-Side Compute Service
+Each compute host runs a nova-compute service.
 In this lab:
-
-```text
 node1
 └── nova-compute
 
@@ -263,27 +254,11 @@ node2
 
 node3
 └── nova-compute
-```
-
-If the scheduler selects node2, the work eventually reaches:
-
-```text
+If Nova Scheduler selects node2, the work eventually reaches:
 nova-compute on node2
-```
-
-Nova Compute manages the instance on that host.
-
-But:
-
-> `nova-compute` is not itself the hypervisor.
-
----
-
-# 9. libvirt, QEMU, and KVM
-
+That service manages the instance lifecycle on the selected host.
+13. libvirt, QEMU, and KVM
 The virtualization stack is approximately:
-
-```text
 Nova Compute
      |
      v
@@ -297,99 +272,42 @@ Nova Compute
      |
      v
 Linux kernel / CPU virtualization
-```
-
-## KVM
-
-KVM is Linux kernel virtualization support.
-
-In this lab it was verified with:
-
-```bash
-ls -l /dev/kvm
-```
-
-and:
-
-```bash
-lsmod | grep kvm
-```
-
-The nodes showed components such as:
-
-```text
+KVM
+KVM provides hardware-assisted virtualization through the Linux kernel.
+The lab verified:
 /dev/kvm
-kvm_intel
-kvm
-```
-
-That tells us the physical hosts already support hardware-assisted virtualization.
-
-## QEMU
-
-QEMU provides the VM process and device emulation.
-
-## libvirt
-
-libvirt provides a management API used by software such as Nova to control the virtualization layer.
-
-The useful mental model is:
-
-```text
+on all three physical nodes.
+QEMU
+QEMU provides the VM process and virtual hardware/device model.
+libvirt
+libvirt provides a management API used by Nova to control QEMU/KVM.
+Memory:
 Nova asks libvirt
 
 libvirt manages QEMU/KVM
 
 QEMU/KVM runs the VM
-```
+14. VMware-Oriented Compute View
+OpenStack/Linux	VMware-ish Mental Model
+Nova	VM lifecycle/orchestration
+Nova Scheduler	Placement logic
+nova-compute	Host-side compute service
+libvirt	Virtualization management API
+QEMU/KVM	Hypervisor/runtime layer
+Instance	Virtual Machine
 
----
 
-# 10. VMware-Oriented Compute View
-
-A simplified comparison:
-
-| OpenStack/Linux | VMware-ish Mental Model |
-|---|---|
-| Nova | VM lifecycle/orchestration |
-| Nova Scheduler | VM placement logic |
-| nova-compute | Host-side compute service |
-| libvirt | Virtualization management API |
-| QEMU/KVM | Hypervisor/runtime layer |
-| Instance | Virtual Machine |
-
-These are learning analogies.
-
-They are not exact product equivalents.
-
----
-
-# 11. Glance — IMAGE
-
+These are learning analogies rather than exact equivalents.
+15. Glance — IMAGE
 Glance is the OpenStack Image service.
-
-A typical image might be:
-
-```text
-ubuntu-24.04.qcow2
-```
-
-Glance stores image metadata and provides images used when launching instances.
-
-A useful VMware mental model is:
-
-```text
-Glance image
-    ~
-VM template / image repository concept
-```
-
+Typical images may include:
+CirrOS
+Ubuntu cloud image
+Rocky Linux cloud image
 Conceptually:
-
-```text
 Nova
  |
- | need Ubuntu image
+ | needs image
  v
 Glance
  |
@@ -398,103 +316,62 @@ Compute host
  |
  v
 VM
-```
-
-Glance is **not** the running VM disk service itself.
-
-Later, Ceph can be used as a backend for Glance image data.
-
-For now remember:
-
-```text
+A VMware-style mental model is:
+Glance image
+    ~
+template / image repository concept
+Glance is not the running VM itself.
+Memory:
 Glance = IMAGE
-```
-
----
-
-# 12. Neutron — NETWORK
-
+16. Neutron — NETWORK
 Neutron is the OpenStack Networking service.
-
-It manages concepts such as:
-
-```text
+It manages logical objects such as:
 networks
 subnets
 ports
 routers
 DHCP
 security groups
-floating IPs
+Floating IPs
 external networks
-```
+A VMware-oriented mapping:
+OpenStack	VMware-ish Mental Model
+Neutron Network	Port Group / logical network
+Neutron Port	VM vNIC connection
+Subnet	IP subnet configuration
+Neutron Router	Virtual L3 router
+Security Group	Distributed firewall-like rules
+Floating IP	External NAT address
+Open vSwitch	Software switching layer
 
-A useful VMware-oriented mapping is:
 
-| OpenStack | VMware-ish Mental Model |
-|---|---|
-| Neutron Network | Port Group / logical network |
-| Neutron Port | VM vNIC connection |
-| Subnet | IP subnet configuration |
-| Neutron Router | Virtual L3 router |
-| Security Group | Distributed firewall-like rule set |
-| Floating IP | External NAT address |
-| Open vSwitch | Software switching layer |
-
-Again, these are learning analogies rather than exact 1:1 mappings.
-
----
-
-# 13. Private Network Example
-
-Imagine we create:
-
-```text
-Network: private-net
+Again, these are learning aids, not exact product mappings.
+17. Private Network Example
+Imagine:
+Network:
+private-net
 
 Subnet:
 10.10.10.0/24
-```
-
 Two VMs might receive:
-
-```text
 VM1 = 10.10.10.25
 VM2 = 10.10.10.26
-```
-
 Conceptually:
-
-```text
 VM1                  VM2
 10.10.10.25          10.10.10.26
  |                      |
  +------ private-net ----+
            |
       10.10.10.0/24
-```
-
-This gives internal connectivity.
-
-But external access requires routing.
-
----
-
-# 14. Neutron Router
-
-A Neutron router connects private and external networks.
-
-```text
+This gives tenant/internal connectivity.
+External access requires routing.
+18. Neutron Router
+A Neutron router connects Layer-3 networks.
+For example:
                Neutron Router
-                 /         \
-                /           \
-       private-net        external-net
+                 /                         /                  private-net        external-net
        10.10.10.0/24      192.168.0.0/24
-```
-
-Traffic can then follow a path such as:
-
-```text
+A simplified north-south path is:
 VM
  |
 private-net
@@ -503,454 +380,303 @@ Neutron Router
  |
 external-net
  |
-Home LAN / router
+br-ex
  |
-Internet
-```
-
-This router is virtual.
-
-It is part of the OpenStack networking environment.
-
----
-
-# 15. Floating IP
-
+ext0
+ |
+physical LAN
+The deeper implementation is covered in Chapters 05 and 06.
+19. Floating IP
 A VM may have an internal address:
+10.20.0.188
+That address is not directly exposed to the home LAN.
+A Floating IP can provide an externally reachable NAT address.
+The current lab has validated:
+VM:
+ai-cirros-01
 
-```text
-10.10.10.25
-```
+Fixed IP:
+10.20.0.188
 
-That address is not necessarily directly reachable from the home LAN.
-
-A Floating IP can provide an external NAT address.
-
-For example:
-
-```text
 Floating IP:
-192.168.0.160
-
-Internal VM IP:
-10.10.10.25
-```
-
+192.168.0.153
 Conceptually:
-
-```text
-Laptop
- |
- | ssh 192.168.0.160
- v
-Neutron
- |
- | NAT
- v
-10.10.10.25
- |
+Hermes / LAN
+     |
+     | ping / SSH
+     v
+192.168.0.153
+     |
+     | Neutron NAT
+     v
+10.20.0.188
+     |
+     v
 VM
-```
-
-So the VM can keep its private address while still being reachable through an external address.
-
----
-
-# 16. Why We Built veth-ovs
-
-Our current single-NIC lab networking looks like this:
-
-```text
-                     HOME LAN
-                        |
-                   enp0s31f6
-                        |
-                     br-mgmt
-                    /       \
-             management     veth-host
-                               ||
-                               ||
-                            veth-ovs
-```
-
-The management IPs live on:
-
-```text
-br-mgmt
-```
-
-For example:
-
-```text
-node1 = 192.168.0.200
-node2 = 192.168.0.201
-node3 = 192.168.0.202
-```
-
-The free side:
-
-```text
-veth-ovs
-```
-
-is intended to become the external-facing Neutron interface.
-
-Later:
-
-```text
-veth-ovs
-   |
-   v
- br-ex
-   |
-   v
-Neutron
-```
-
-So the Linux bridge and veth work was preparing a path between:
-
-```text
-OpenStack virtual networking
-        |
-        v
-physical home LAN
-```
-
-It was not random Linux configuration.
-
----
-
-# 17. Open vSwitch
-
+The latest cold-boot validation produced:
+4 transmitted
+4 received
+0% packet loss
+20. Open vSwitch
 Open vSwitch is usually abbreviated:
-
-```text
 OVS
-```
-
-It is a software switching platform.
-
-Later we will see bridge names such as:
-
-```text
+It provides software switching used by Neutron.
+Important bridges include:
 br-int
 br-ex
-```
-
-For now, use this simplified mental model:
-
-```text
-br-int = OpenStack internal integration switching
-
-br-ex = bridge toward the external physical network
-```
-
-A simplified traffic path:
-
-```text
-VM
- |
-virtual interface
- |
+Memory:
 br-int
- |
+    OpenStack internal integration switching
+
+br-ex
+    external/provider bridge
+The current external path is:
 Neutron
- |
+   |
 br-ex
- |
+   |
+ext0
+   |
+physical LAN
+21. OVS in This Kolla Deployment
+In this lab, OVS is managed inside Kolla containers.
+Inspect it with:
+sudo docker exec openvswitch_vswitchd   ovs-vsctl show
+Inspect br-ex:
+sudo docker exec openvswitch_vswitchd   ovs-vsctl list-ports br-ex
+The current validated br-ex ports are:
+ext0
+phy-br-ex
+on all three nodes.
+22. Historical Single-NIC Architecture
+The lab originally used:
+br-ex
+  |
 veth-ovs
- |
-physical network
-```
-
-The real networking path contains more detail.
-
-We will inspect the actual bridges after Kolla creates them.
-
----
-
-# 18. Common Neutron Containers
-
-Kolla-Ansible may later deploy containers with names such as:
-
-```text
-neutron_server
-neutron_openvswitch_agent
-neutron_l3_agent
-neutron_dhcp_agent
-neutron_metadata_agent
-```
-
-Human translation:
-
-```text
+  ||
+veth-host
+  |
+br-mgmt
+  |
+enp0s31f6
+This design was useful because it allowed one physical NIC to carry both:
+management traffic
++
+Neutron external traffic
+It is preserved as a learning stage in:
+docs/03-openstack-single-nic-networking.md
+It should not be confused with the current dual-NIC architecture.
+23. Common Neutron Services
+The deployed environment contains Neutron components with roles such as:
 neutron-server
-    Neutron API / central service
+neutron-openvswitch-agent
+neutron-l3-agent
+neutron-dhcp-agent
+neutron-metadata-agent
+Human translation:
+neutron-server
+    Neutron API / control service
 
 neutron-openvswitch-agent
-    Manages OVS networking on hosts
+    manages OVS networking
 
 neutron-l3-agent
-    Routing and NAT
+    routing and NAT
 
 neutron-dhcp-agent
-    Provides IP configuration to instances
+    DHCP for tenant networks
 
 neutron-metadata-agent
-    Helps instances access cloud metadata
-```
-
-Do not memorize every container name yet.
-
-The purpose of this section is simply to make the names recognizable during deployment.
-
----
-
-# 19. MariaDB — REMEMBER
-
-OpenStack services need persistent databases.
-
-MariaDB stores service state such as configuration and resource records.
-
+    metadata access support
+The exact implementation details are explored in Chapters 05 and 06.
+24. MariaDB — REMEMBER
+OpenStack services require persistent databases.
 Conceptually:
-
-```text
-Nova     ─┐
-Neutron  ─┼──> Service Databases
-Keystone ─┤          |
-Glance   ─┘       MariaDB
-```
-
-The memory hook is:
-
-```text
+Nova      ─┐
+Neutron   ─┼──> service databases
+Keystone  ─┤
+Glance    ─┤
+Placement ─┘
+             |
+             v
+          MariaDB
+Memory:
 MariaDB = REMEMBER
-```
-
-It stores information that OpenStack services need to persist.
-
----
-
-# 20. RabbitMQ — TALK
-
-OpenStack services also need to communicate internally.
-
-RabbitMQ provides a messaging system used by services for asynchronous communication and RPC.
-
+A healthy database layer is critical because API containers can still be running while database-backed operations fail.
+25. ProxySQL — Database Proxy Layer
+The current Kolla deployment also uses ProxySQL.
+A simplified model is:
+OpenStack service
+       |
+       v
+    ProxySQL
+       |
+       v
+    MariaDB
+ProxySQL provides a database proxy layer in front of the MariaDB cluster.
+The health script checks:
+MariaDB
+ProxySQL
+separately.
+26. RabbitMQ — TALK
+OpenStack services communicate internally using messaging.
+RabbitMQ provides messaging used for RPC and asynchronous service communication.
 A simplified example:
-
-```text
-Nova Scheduler
-      |
-      v
-   RabbitMQ
-      |
-      v
+Nova control service
+       |
+       v
+    RabbitMQ
+       |
+       v
 nova-compute
-```
-
-The memory hook is:
-
-```text
+Memory:
 RabbitMQ = TALK
-```
-
-It helps OpenStack services communicate with each other.
-
----
-
-# 21. End-to-End: Create One VM
-
-Imagine we eventually run:
-
-```bash
-openstack server create \
-  --image ubuntu-24.04 \
-  --flavor m1.small \
-  --network private-net \
-  ubuntu01
-```
-
+Important:
+VM packets do not pass through RabbitMQ.
+RabbitMQ belongs to the service/control communication plane.
+27. HAProxy — LOAD BALANCE
+The OpenStack APIs run across multiple control nodes.
+Clients use:
+192.168.0.100
+rather than targeting an individual controller.
+Conceptually:
+OpenStack CLI / Terraform
+          |
+          v
+   192.168.0.100
+          |
+          v
+       HAProxy
+      /   |        /    |     node1  node2  node3
+Memory:
+HAProxy = LOAD BALANCE
+28. Keepalived — VIP
+Keepalived provides high availability for:
+192.168.0.100/32
+One eligible node owns the VIP at a time.
+After the latest cold boot, the VIP was observed on:
+node2
+Conceptually:
+node1
+node2
+node3
+   |
+Keepalived election/failover
+   |
+192.168.0.100
+Memory:
+Keepalived = VIP
+29. API VIP HA Is Not Neutron Router HA
+These are separate concepts.
+API VIP HA
+Protects OpenStack API access.
+client
+  |
+192.168.0.100
+  |
+Keepalived
+  |
+HAProxy
+  |
+OpenStack APIs
+Neutron router HA
+Protects VM routing.
+VM
+ |
+Neutron router
+ |
+external network
+Do not assume router HA merely because the API VIP is highly available.
+30. End-to-End: Create One VM
+Imagine:
+openstack server create   --image cirros-0.6.3   --flavor m1.cirros   --network private-net   test-vm
 What happens?
-
-## Step 1 — Authentication
-
-Keystone checks:
-
-```text
+31. Step 1 — Authentication
+Keystone answers:
 Who are you?
-Are you allowed to do this?
-```
 
-Authentication succeeds and the OpenStack APIs can trust the request.
+What project are you using?
 
----
-
-## Step 2 — Nova API
-
+Are you allowed to perform this action?
+The client receives authenticated API access.
+32. Step 2 — Nova API
 Nova receives:
-
-```text
-Create a new VM called ubuntu01
-```
-
+Create a VM called test-vm
 with information such as:
-
-```text
 image
 flavor
 network
 project
-```
-
----
-
-## Step 3 — Placement
-
+security groups
+33. Step 3 — Placement
 Nova needs to know:
-
-```text
-Which compute hosts have enough resources?
-```
-
-Placement provides resource information.
-
+Which compute resource providers can satisfy the request?
+Placement exposes the resource information and allocations required by Nova.
+34. Step 4 — Nova Scheduler
+Nova Scheduler chooses a compute host.
 For example:
-
-```text
-node1 → possible
-node2 → possible
-node3 → insufficient resources
-```
-
----
-
-## Step 4 — Nova Scheduler
-
-Nova Scheduler chooses a host.
-
-For example:
-
-```text
 node2
-```
-
----
-
-## Step 5 — Glance
-
-Nova needs the selected operating system image:
-
-```text
-Ubuntu 24.04
-```
-
-Glance provides the image information/data needed to boot the instance.
-
----
-
-## Step 6 — Neutron
-
-The VM also needs networking.
-
-Neutron creates things such as:
-
-```text
-virtual network port
+35. Step 5 — Glance
+Nova needs the selected image.
+Glance provides the image metadata/data required to boot the instance.
+36. Step 6 — Neutron
+Neutron creates or uses the networking objects required by the VM.
+Examples:
+Neutron port
 MAC address
-private IP
-network connection
+fixed IP
+network binding
 security group association
-```
-
----
-
-## Step 7 — Internal Messaging
-
+37. Step 7 — Internal Messaging
 Nova services coordinate the work.
-
-RabbitMQ is used as part of the internal messaging infrastructure.
-
+RabbitMQ participates in this service-to-service communication.
 Conceptually:
-
-```text
 Nova control services
        |
        v
     RabbitMQ
        |
        v
-nova-compute node2
-```
-
----
-
-## Step 8 — nova-compute
-
-The `nova-compute` service on node2 receives the work.
-
-It prepares the VM on that compute host.
-
----
-
-## Step 9 — libvirt / QEMU / KVM
-
-Nova Compute communicates with libvirt.
-
-Then:
-
-```text
+nova-compute
+38. Step 8 — nova-compute
+The selected compute node receives the work through nova-compute.
+It prepares the instance on that physical host.
+39. Step 9 — libvirt / QEMU / KVM
+The actual VM execution chain becomes:
+nova-compute
+    |
+    v
 libvirt
-   |
-   v
+    |
+    v
 QEMU
-   |
-   v
+    |
+    v
 KVM
-```
-
-actually runs the virtual machine.
-
----
-
-## Step 10 — Network Attachment
-
-Neutron connects the VM's virtual interface to the OpenStack virtual network.
-
-The VM might receive:
-
-```text
-10.10.10.25
-```
-
----
-
-## Step 11 — Floating IP
-
-If we assign:
-
-```text
-192.168.0.160
-```
-
-as a Floating IP, Neutron can provide a NAT path:
-
-```text
-192.168.0.160
-      |
-      v
-10.10.10.25
-```
-
-Now the VM can be reachable from the home LAN.
-
----
-
-# 22. The Full Mental Picture
-
-This is the main diagram to review:
-
-```text
+    |
+    v
+VM
+40. Step 10 — VM Networking
+Neutron attaches the VM to the requested network.
+The packet path begins with the VM virtual NIC and reaches:
+br-int
+through Neutron/OVS plumbing.
+If the packet must leave the tenant network, it may then reach a Neutron router.
+41. Step 11 — External Connectivity
+For north-south traffic:
+VM
+ |
+Neutron internal network
+ |
+Neutron Router
+ |
+br-ex
+ |
+ext0
+ |
+physical LAN
+If a Floating IP is associated, Neutron also provides the NAT relationship.
+42. The Full VM-Creation Mental Picture
                        USER
                         |
             CLI / Horizon / Terraform
@@ -974,11 +700,10 @@ This is the main diagram to review:
                         |
                  Nova Scheduler
                         |
-                  choose node2
+                 choose a host
                         |
                         v
                  nova-compute
-                    node2
                         |
                         v
                     libvirt
@@ -987,203 +712,80 @@ This is the main diagram to review:
                    QEMU + KVM
                         |
                         v
-                   +---------+
-                   | ubuntu01|
-                   +---------+
+                      VM
                         |
                    virtual NIC
                         |
                      Neutron
                         |
-                  private-net
-                   10.10.10.x
+                     br-int
                         |
                  Neutron Router
                         |
                      br-ex
                         |
-                    veth-ovs
-                        ||
-                    veth-host
+                      ext0
                         |
-                     br-mgmt
-                        |
-                   enp0s31f6
-                        |
-                    HOME LAN
-```
-
-That is the basic OpenStack cloud we are building.
-
----
-
-# 23. Where Kolla Fits
-
-Kolla does not replace these services.
-
-Kolla provides container images containing OpenStack services.
-
+                  physical LAN
+This is the current architecture to remember.
+43. Where Kolla Fits
+Kolla does not replace OpenStack services.
+Think:
+Kolla
+    provides container images
+Kolla-Ansible then deploys and configures those images.
 Conceptually:
-
-```text
-OpenStack Services
-        |
-        v
-Kolla Container Images
-        |
-        v
+OpenStack services
+       |
+       v
+Kolla container images
+       |
+       v
 Kolla-Ansible
-        |
-        v
-Deploy and configure containers
-```
-
-Examples of containers we may eventually see:
-
-```text
-keystone
-nova_api
-nova_scheduler
-nova_compute
-placement_api
-glance_api
-neutron_server
-rabbitmq
-mariadb
-haproxy
-keepalived
-```
-
-Before this architecture lesson, those names looked like random containers.
-
-Now we can begin mapping them back to their purpose.
-
----
-
-# 24. Kolla vs Kolla-Ansible
-
-These names are related but different.
-
-## Kolla
-
-Think:
-
-```text
-Kolla = container images
-```
-
+       |
+       v
+Docker containers on node1/node2/node3
+44. Kolla vs Kolla-Ansible
+Kolla
+Kolla
+    = container images
 Examples:
-
-```text
-Nova container image
-Neutron container image
-Keystone container image
-Glance container image
-```
-
-## Kolla-Ansible
-
-Think:
-
-```text
-Kolla-Ansible = deployment automation
-```
-
-It uses Ansible to determine:
-
-```text
-which nodes run which services
-how services are configured
-how containers are started
-how networking is configured
-how HA is configured
-```
-
-A useful comparison:
-
-```text
-Kubespray
-   |
-   +--> Ansible deploys Kubernetes
-
+Nova image
+Neutron image
+Keystone image
+Glance image
 Kolla-Ansible
-   |
-   +--> Ansible deploys OpenStack
-```
-
-They are not the same project.
-
-They simply have a similar automation role.
-
----
-
-# 25. Why One Node Can Be Control AND Compute
-
-Our lab is using a converged three-node architecture.
-
-Our Kolla inventory contains nodes in multiple groups.
-
-For example:
-
-```ini
-[control]
+Kolla-Ansible
+    = Ansible deployment automation
+It determines and configures things such as:
+which nodes run which services
+service configuration
+container startup
+network mappings
+HA configuration
+database initialization
+service registration
+45. Why One Node Can Be Control AND Compute
+This lab uses a converged three-node design.
+Conceptually:
 node1
-node2
-node3
-
-[network]
-node1
-node2
-node3
-
-[compute]
-node1
-node2
-node3
-```
-
-That is intentional.
-
-It means:
-
-```text
-node1
-├── control services
-├── network services
-└── compute workloads
+├── control
+├── network
+└── compute
 
 node2
-├── control services
-├── network services
-└── compute workloads
+├── control
+├── network
+└── compute
 
 node3
-├── control services
-├── network services
-└── compute workloads
-```
-
-A server can therefore run both:
-
-```text
-OpenStack control-plane containers
-```
-
-and:
-
-```text
-virtual machines
-```
-
-This is useful for a small homelab because we only have three physical nodes.
-
----
-
-# 26. Control Plane vs Compute Plane
-
-Another useful mental picture:
-
-```text
+├── control
+├── network
+└── compute
+This is intentional.
+A small homelab gets more usable compute capacity when all three nodes participate in multiple roles.
+46. Control Plane vs Compute Plane
+A useful distinction:
 CONTROL PLANE
 -------------
 Keystone
@@ -1193,6 +795,7 @@ Placement
 Glance
 Neutron API
 MariaDB
+ProxySQL
 RabbitMQ
 HAProxy
 Keepalived
@@ -1201,191 +804,130 @@ Keepalived
         | controls
         v
 
-COMPUTE PLANE
--------------
+COMPUTE / DATA EXECUTION
+------------------------
 nova-compute
 libvirt
-QEMU
-KVM
+QEMU/KVM
 VMs
-```
+The physical nodes host both planes in this converged design.
+47. Control Plane vs Network Data Plane
+Another important distinction:
+NETWORK CONTROL PLANE
+---------------------
+Neutron API
+neutron-server
+Neutron agents
+database
+RabbitMQ
 
-Our three-node lab mixes both planes onto the same physical servers.
+        |
+        | desired state
+        v
 
-In a larger environment, they may be separated.
-
----
-
-# 27. HAProxy and Keepalived
-
-These two components become important because we have three control nodes.
-
-Our OpenStack API VIP is planned as:
-
-```text
-192.168.0.100
-```
-
-Instead of users connecting directly to:
-
-```text
-node1
-node2
-node3
-```
-
-they can use:
-
-```text
-192.168.0.100
-```
-
-Conceptually:
-
-```text
-             192.168.0.100
-                   |
-                   v
-              Keepalived
-                   |
-                   v
-                HAProxy
-              /    |    \
-             /     |     \
-          node1  node2  node3
-```
-
-## Keepalived
-
-Memory hook:
-
-```text
-Keepalived = VIP
-```
-
-It provides high availability for the virtual IP.
-
-## HAProxy
-
-Memory hook:
-
-```text
-HAProxy = LOAD BALANCE
-```
-
-It sends API traffic toward available OpenStack services.
-
-So eventually:
-
-```text
-OpenStack CLI
-      |
-      v
-192.168.0.100
-      |
-      v
-HAProxy
-      |
-      +--> node1 API
-      +--> node2 API
-      +--> node3 API
-```
-
----
-
-# 28. Where Cinder Fits
-
-We have not deployed Cinder yet.
-
+NETWORK DATA PLANE
+------------------
+VM interfaces
+br-int
+VXLAN
+router namespaces
+br-ex
+ext0
+physical LAN
+This explains why:
+Neutron API healthy
+does not automatically mean:
+VM network traffic works.
+Both layers must be validated.
+48. What the Health Script Proves
+The repository contains:
+scripts/lab-status.sh
+The current healthy baseline includes:
+3/3 nodes reachable
+3/3 MariaDB healthy
+3/3 ProxySQL healthy
+3/3 Placement API healthy
+12/12 Nova control healthy
+9/9 Neutron control healthy
+Keystone authentication works
+6/6 Nova control services enabled/up
+3/3 nova-compute enabled/up
+3/3 hypervisors up
+12/12 Neutron agents alive/up
+Result:
+RESULT: HEALTHY
+PASS checks: 14
+This validates multiple control-plane layers.
+49. What the Floating-IP Test Proves
+The lab also validates a real workload path.
+ai-cirros-01
+Fixed IP:    10.20.0.188
+Floating IP: 192.168.0.153
+A successful ping after cold boot proves more than API health.
+It validates:
+physical external NIC
+br-ex
+Neutron routing/NAT
+Floating IP
+VM network path
+running workload
+This is data-plane evidence.
+50. Why Container Health Alone Is Not Enough
+A container can be:
+running
+while the OpenStack service is:
+unusable
+Examples:
+nova-compute container running
+but
+Nova service DOWN
+or:
+Keystone container running
+but
+authentication fails
+Therefore troubleshoot at several layers:
+container
+service
+API
+data plane
+51. Cinder — BLOCK STORAGE
 Cinder is the OpenStack Block Storage service.
-
 Think:
-
-```text
-Cinder = attachable VM disks
-```
-
-For example:
-
-```text
+Cinder = attachable VM volumes
+Conceptually:
 VM
  |
  +-- root disk
  |
- +-- Cinder volume: 100 GB
-```
-
-A VMware-oriented mental model might be:
-
-```text
+ +-- Cinder volume
+A VMware-oriented mental model is:
 Cinder volume
     ~
-virtual disk backed by shared/block storage
-```
-
-Again, not an exact 1:1 comparison.
-
----
-
-# 29. Where Ceph Fits
-
+virtual disk / block-storage service
+Cinder is useful to understand even if it is not the main focus of the current learning stage.
+52. Ceph — DISTRIBUTED STORAGE
 Ceph is not OpenStack itself.
-
-Ceph is a distributed storage platform.
-
-It can provide storage backends for OpenStack.
-
-Eventually our design may look like:
-
-```text
-                 OpenStack
-                     |
-          +----------+----------+
-          |          |          |
-          v          v          v
-        Glance     Cinder      Nova
-          \          |          /
-           \         |         /
-            +--------+--------+
-                     |
-                     v
-                   Ceph
-```
-
-Possible uses:
-
-```text
-Glance
-  → image storage
-
-Cinder
-  → block volumes
-
-Nova
-  → VM disk storage
-```
-
-Our three nodes each have an additional disk:
-
-```text
-node1 /dev/sda
-node2 /dev/sda
-node3 /dev/sda
-```
-
-Those disks still contain old Ceph BlueStore metadata.
-
-We are intentionally **not wiping them yet**.
-
-Ceph comes later after the basic OpenStack architecture is understood.
-
----
-
-# 30. Why We Are Delaying Ceph
-
-There are already many moving parts:
-
-```text
+It is a distributed storage platform that OpenStack can use as a backend.
+Conceptually:
+             OpenStack
+                 |
+       +---------+---------+
+       |         |         |
+       v         v         v
+     Glance    Cinder     Nova
+       \         |         /
+        \        |        /
+         +-------+-------+
+                 |
+                 v
+               Ceph
+Possible uses include:
+Glance image data
+Cinder volumes
+Nova instance disks
+The current homelab disks still contain historical Ceph BlueStore metadata, but Ceph is not required to understand the core control-plane architecture documented here.
+53. Why Ceph Is a Separate Learning Layer
+OpenStack already includes many moving parts:
 Keystone
 Nova
 Placement
@@ -1393,153 +935,174 @@ Glance
 Neutron
 RabbitMQ
 MariaDB
+ProxySQL
 HAProxy
 Keepalived
 KVM
 OVS
-```
-
-Adding Ceph immediately would introduce even more concepts:
-
-```text
+Ceph introduces another distributed system:
 MON
 MGR
 OSD
 CRUSH
 RBD
 pools
-PGs
 replication
-```
+It is easier to learn after the OpenStack control/network/compute architecture is already familiar.
+54. VMware-Oriented Review Table
+OpenStack / Component	Purpose	VMware-ish Mental Model
+Keystone	Identity/authentication	vCenter SSO / RBAC concepts
+Nova	Compute lifecycle	VM management/orchestration
+Placement	Resource inventory/allocation	Resource availability
+Nova Scheduler	Select compute host	Placement/scheduling logic
+nova-compute	Host-side compute service	Host-side VM management
+Glance	Image service	Template/image repository
+Neutron	Networking	Virtual networking platform
+Cinder	Block storage	VM disk/block storage service
+Horizon	Web UI	Management UI
+MariaDB	Persistent service state	Backend database
+ProxySQL	DB proxy layer	Database proxy/load-balancing concept
+RabbitMQ	Internal messaging	Message bus
+HAProxy	API load balancing	Load balancer
+Keepalived	VIP failover	Virtual IP HA
+libvirt	Virtualization API	Hypervisor management layer
+QEMU/KVM	VM runtime	Hypervisor/runtime layer
 
-So our learning order is:
-
-```text
-OpenStack architecture
-        |
-        v
-Deploy basic OpenStack
-        |
-        v
-Create first VM
-        |
-        v
-Understand Neutron
-        |
-        v
-Understand Cinder
-        |
-        v
-Ceph
-```
-
-That keeps each layer understandable.
-
----
-
-# 31. VMware-Oriented Review Table
-
-| OpenStack | Purpose | VMware-ish Mental Model |
-|---|---|---|
-| Keystone | Identity/authentication | vCenter SSO / RBAC concepts |
-| Nova | Compute lifecycle | VM management/orchestration |
-| Placement | Resource inventory/allocation | Resource availability information |
-| Nova Scheduler | Select compute host | Placement/scheduling logic |
-| nova-compute | Host-side compute service | Host-side VM management |
-| Glance | Image service | Template/image repository |
-| Neutron | Networking | Virtual networking platform |
-| Cinder | Block storage | VM disk/block storage service |
-| Horizon | Web UI | Management UI |
-| MariaDB | Persistent service state | Backend database |
-| RabbitMQ | Internal messaging | Message bus |
-| HAProxy | API load balancing | Load balancer |
-| Keepalived | Virtual IP HA | VIP failover |
-| libvirt | Virtualization API | Hypervisor management layer |
-| QEMU/KVM | VM runtime | Hypervisor/runtime layer |
 
 These comparisons are learning aids rather than exact equivalents.
+55. Terraform Fits Above the OpenStack APIs
+Terraform does not replace Nova, Neutron, or Keystone.
+Terraform describes desired cloud resources and calls the OpenStack APIs.
+Conceptually:
+Terraform
+    |
+    v
+OpenStack API
+    |
+    +-- Nova
+    +-- Neutron
+    +-- Glance data lookups
+    +-- Keystone authentication
+Example:
+Terraform resource:
+openstack_compute_instance_v2
 
----
+        |
+        v
 
-# 32. Review Cheat Sheet
+Nova API
 
-If everything else disappears from memory, remember this:
+        |
+        v
 
-```text
-Keystone  = WHO
-Nova      = VM
-Placement = WHERE
-Glance    = IMAGE
-Neutron   = NETWORK
+OpenStack VM
+This is why learning the OpenStack architecture first makes Terraform much easier to understand.
+56. Ansible Fits at a Different Layer
+Ansible is mainly used here for:
+host preparation
+Linux configuration
+preflight checks
+network configuration
+application configuration
+Kolla-Ansible then uses Ansible to deploy OpenStack itself.
+A useful distinction:
+Terraform
+    creates cloud infrastructure
 
-MariaDB   = REMEMBER
-RabbitMQ  = TALK
+Ansible
+    configures systems
 
-HAProxy   = LOAD BALANCE
-Keepalived = VIP
+Kolla-Ansible
+    configures/deploys OpenStack services
+They overlap in automation philosophy but operate at different layers.
+57. Hermes Fits Above the Automation
+Hermes should be treated as an assistant around the IaC workflow.
+Conceptually:
+User request
+    |
+    v
+Hermes
+    |
+    v
+Terraform / Ansible change
+    |
+    v
+Git diff / validation
+    |
+    v
+Human approval
+    |
+    v
+execution
+Hermes should understand the architecture so that a request such as:
+Create a new private network and VM.
+can be translated into the correct IaC resources rather than random shell commands.
+58. Desired State Appears Everywhere
+The same idea appears repeatedly:
+Terraform:
+resource should exist
 
-KVM       = RUN
-Cinder    = BLOCK STORAGE
-Ceph      = DISTRIBUTED STORAGE
-```
+Ansible:
+host should have this configuration
 
-And the short VM creation story:
+Neutron:
+router/network/port should exist
 
-```text
-WHO?
- |
- v
-Keystone
-
-I WANT A VM
- |
- v
+Kolla-Ansible:
+OpenStack service configuration should match globals/inventory
+This is one of the most transferable infrastructure concepts in the entire lab.
+59. The OpenStack Service Dependency Story
+A simplified dependency picture:
+User / Terraform
+       |
+       v
+   Keystone
+       |
+       v
+ OpenStack APIs
+       |
+       +--> Nova
+       +--> Neutron
+       +--> Glance
+       +--> Placement
+       |
+       +--> MariaDB / ProxySQL
+       |
+       +--> RabbitMQ
+Then compute execution continues:
 Nova
-
-WHERE CAN IT RUN?
- |
- v
-Placement
-
-CHOOSE A HOST
- |
- v
-Nova Scheduler
-
-WHICH IMAGE?
- |
- v
-Glance
-
-WHICH NETWORK?
- |
- v
-Neutron
-
-RUN IT
  |
  v
 nova-compute
  |
+ v
 libvirt
  |
+ v
 QEMU/KVM
  |
+ v
 VM
-```
-
----
-
-# 33. The 30-Second OpenStack Explanation
-
+And network execution continues:
+Neutron
+ |
+ v
+OVS / namespaces / VXLAN
+ |
+ v
+br-ex
+ |
+ v
+ext0
+ |
+ v
+physical LAN
+60. The 30-Second OpenStack Explanation
 If someone asks:
+What happens when OpenStack creates a VM?
 
-> What happens when OpenStack creates a VM?
-
-A good short answer is:
-
-```text
-Keystone authenticates the user.
+A strong short answer is:
+Keystone authenticates the request.
 
 Nova receives the VM request.
 
@@ -1547,108 +1110,165 @@ Placement reports available compute resources.
 
 Nova Scheduler chooses a compute node.
 
-Glance provides the VM image.
+Glance provides the image.
 
-Neutron provides networking.
+Neutron provides the VM network connectivity.
 
-RabbitMQ helps the services communicate.
+RabbitMQ helps OpenStack services communicate.
 
 nova-compute asks libvirt/QEMU/KVM to run the VM.
 
-MariaDB stores persistent OpenStack state.
-```
+MariaDB stores persistent service state.
 
-If that explanation makes sense, the architecture is already starting to stick.
+If external connectivity is required, Neutron routes through br-ex and ext0.
+If that explanation makes sense, the architecture is starting to stick.
+61. Review Cheat Sheet
+Keystone
+    WHO
 
----
+Nova
+    VM
 
-# 34. What Comes Next
+Placement
+    WHERE
 
-The next architecture lesson is:
+Glance
+    IMAGE
 
-# Neutron Packet Walk
-
-Instead of learning more service names, we will follow an actual packet.
-
-Example:
-
-```text
-ubuntu01
-   |
-   | ping 8.8.8.8
-   v
-VM NIC
-   |
-   v
-OpenStack internal network
-   |
-   v
-Neutron Router
-   |
-   v
-br-ex
-   |
-   v
-veth-ovs
-   |
-   v
-veth-host
-   |
-   v
-br-mgmt
-   |
-   v
-enp0s31f6
-   |
-   v
-Home Router
-   |
-   v
-Internet
-```
-
-Then we will reverse the direction:
-
-```text
-Laptop
-   |
-   | ssh 192.168.0.160
-   v
-Floating IP
-   |
-   v
 Neutron
-   |
-   v
-NAT
-   |
-   v
-10.10.10.25
-   |
-   v
-ubuntu01
-```
+    NETWORK
 
-That lesson will connect:
+MariaDB
+    REMEMBER
 
-```text
+ProxySQL
+    DB PROXY
+
+RabbitMQ
+    TALK
+
+HAProxy
+    LOAD BALANCE
+
+Keepalived
+    VIP
+
+KVM
+    RUN
+
+Cinder
+    BLOCK STORAGE
+
+Ceph
+    DISTRIBUTED STORAGE
+62. Current End-to-End Network Memory Hook
+For a VM reaching the home LAN or Internet:
+VM
+ |
+ v
+Neutron port
+ |
+ v
+br-int
+ |
+ v
+Neutron router
+ |
+ v
+br-ex
+ |
+ v
+ext0
+ |
+ v
+physical LAN
+ |
+ v
+home router / Internet
+For incoming Floating-IP traffic:
+LAN client
+ |
+ v
+Floating IP
+ |
+ v
+ext0
+ |
+ v
+br-ex
+ |
+ v
+Neutron router / NAT
+ |
+ v
+VM fixed IP
+The detailed packet walk is in:
+docs/05-neutron-packet-walk.md
+63. Current Control-Plane Memory Hook
+Hermes
+  |
+  v
+192.168.0.100
+OpenStack API VIP
+  |
+  v
+HAProxy
+  |
+  +--> API services on node1
+  +--> API services on node2
+  +--> API services on node3
+Keepalived controls which node currently owns:
+192.168.0.100/32
+64. Current Three-Node Mental Picture
+                         HERMES
+                           |
+         Ansible / Kolla / Terraform / CLI
+                           |
+                           v
+                    192.168.0.100
+                     API VIP
+                           |
+                        HAProxy
+                           |
+          +----------------+----------------+
+          |                |                |
+          v                v                v
+        node1            node2            node3
+       .200              .201              .202
+          |                |                |
+    control/network  control/network  control/network
+       compute           compute           compute
+          |                |                |
+          +----------------+----------------+
+                           |
+               OpenStack services
+                           |
+          +----------------+----------------+
+          |                                 |
+       br-mgmt                            br-ex
+          |                                 |
+     enp0s31f6                            ext0
+          |                                 |
+ management/API/VXLAN              Neutron external
+That is the architecture to carry forward.
+65. What Comes Next
+After understanding the high-level architecture, the next chapter follows a real packet through Neutron:
+docs/05-neutron-packet-walk.md
+That chapter turns:
 Neutron
 OVS
 br-int
 br-ex
-veth pairs
-routers
+router
 NAT
-Floating IPs
-```
-
-to the Linux networking work already completed in this lab.
-
----
-
-# Final Memory Hook
-
-```text
+Floating IP
+VXLAN
+ext0
+into an actual packet path.
+Then:
+docs/06-neutron-router-agents-and-ha.md
+explains router placement, namespaces, agents, HA, and DVR concepts.
+66. Final Memory Hook
 WHO      = Keystone
 VM       = Nova
 WHERE    = Placement
@@ -1657,8 +1277,9 @@ NETWORK  = Neutron
 REMEMBER = MariaDB
 TALK     = RabbitMQ
 RUN      = KVM
-```
-
-Do not try to memorize everything at once.
-
-The important goal is to recognize each service when we see it during the real Kolla-Ansible deployment.
+VIP      = Keepalived
+BALANCE  = HAProxy
+DB PROXY = ProxySQL
+Do not memorize every daemon.
+Understand which layer owns which responsibility.
+That is enough to make the rest of OpenStack much easier to learn.
