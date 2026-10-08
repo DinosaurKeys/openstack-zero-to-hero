@@ -295,21 +295,36 @@ Configures the OpenStack provider:
 
 ```hcl
 provider "openstack" {
-  cloud = "kolla-admin"
 }
 ```
 
-Authentication continues to use:
+The provider intentionally does **not** hardcode an OpenStack cloud profile.
+
+Authentication is selected by the human operator at execution time using:
 
 ```text
-/etc/kolla/clouds.yaml
+OS_CLIENT_CONFIG_FILE
+OS_CLOUD
 ```
 
-through:
+For example, an administrator-operated session may intentionally use:
 
 ```bash
 export OS_CLIENT_CONFIG_FILE=/etc/kolla/clouds.yaml
 export OS_CLOUD=kolla-admin
+```
+
+A restricted Hermes / AI-lab session should instead use its restricted
+OpenStack cloud profile.
+
+This separation is important:
+
+```text
+Terraform code
+    does not choose credentials
+
+Human operator
+    chooses credentials before execution
 ```
 
 No OpenStack password is stored in the Terraform files.
@@ -757,45 +772,28 @@ Terraform-managed rule resources in this configuration.
 
 ---
 
-# 19. Make the OpenStack Client Environment Persistent
+# 19. Select OpenStack Authentication Per Session
 
-Terraform and the OpenStack CLI both need to know where the Kolla-generated
-OpenStack client configuration is located.
+Terraform and the OpenStack CLI need to know which OpenStack credentials
+should be used.
 
-The required environment variables are:
+The Terraform provider itself does not select a cloud:
+
+```hcl
+provider "openstack" {
+}
+```
+
+The human operator selects the OpenStack identity before running Terraform
+or OpenStack CLI commands.
+
+## Administrator-operated session
+
+For intentional administrator work:
 
 ```bash
 export OS_CLIENT_CONFIG_FILE=/etc/kolla/clouds.yaml
 export OS_CLOUD=kolla-admin
-```
-
-These variables exist only in the current shell unless they are made
-persistent.
-
-This became visible after reboot when Terraform returned:
-
-```text
-Error: unable to load clouds.yaml:
-no clouds.yml file found: file does not exist
-```
-
-Temporarily exporting the variables fixed the problem:
-
-```bash
-export OS_CLIENT_CONFIG_FILE=/etc/kolla/clouds.yaml
-export OS_CLOUD=kolla-admin
-```
-
-For the Hermes management VM, add them to:
-
-```text
-~/.bashrc
-```
-
-Then reload the shell configuration:
-
-```bash
-source ~/.bashrc
 ```
 
 Verify:
@@ -812,12 +810,66 @@ Expected:
 kolla-admin
 ```
 
+This is an administrator session and should be used deliberately.
+
+Do **not** hardcode:
+
+```hcl
+cloud = "kolla-admin"
+```
+
+inside Terraform configuration.
+
+Also avoid making the administrator profile a permanent global default in:
+
+```text
+~/.bashrc
+```
+
+because every later Terraform or OpenStack command would silently inherit
+administrator privileges.
+
+## Restricted Hermes / AI-lab session
+
+The Hermes Operator v1 workflow uses a restricted identity instead.
+
+Example:
+
+```bash
+export OS_CLIENT_CONFIG_FILE="$HOME/.config/openstack/hermes-clouds.yaml"
+export OS_CLOUD=hermes-operator
+```
+
+The intended restricted identity is:
+
+```text
+Project: ai-lab
+User:    hermes-operator
+Role:    member
+```
+
+This keeps credential selection outside the Terraform files.
+
+The security boundary becomes:
+
+```text
+Terraform configuration
+        |
+        | no embedded cloud profile
+        v
+Human selects identity
+        |
+        +-- kolla-admin       intentional administrator work
+        |
+        +-- hermes-operator   restricted AI-lab work
+```
+
 Important distinction:
 
 ```text
 OS_CLIENT_CONFIG_FILE + OS_CLOUD
         |
-        +--> Terraform/OpenStack API authentication
+        +--> Terraform / OpenStack API authentication
 
 ~/.ssh/openstack-lab-vm
         |

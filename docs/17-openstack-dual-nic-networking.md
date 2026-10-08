@@ -577,7 +577,7 @@ ssh openstack@192.168.0.200 '
 ```
 
 This rollback was kept available until the new external NIC path had
-been validated.`
+been validated.
 
 # 14. Remove the Old veth Pair from Netplan
 
