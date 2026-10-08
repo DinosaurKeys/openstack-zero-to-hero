@@ -1,1332 +1,693 @@
-# Neutron Routers, Agents, Namespaces, and High Availability
-
-This document explains how Neutron routing works across multiple OpenStack nodes.
-
-The main questions are:
-
-```text
+Neutron Routers, Agents, Namespaces, and High Availability
+This chapter explains how Neutron routing works across the three-node OpenStack homelab.
+The goal is to answer practical questions:
 Where does a Neutron router actually run?
 
-Does every node have the router?
+Does every node have the same router?
 
-Who creates and manages it?
+What does neutron-l3-agent do?
 
-How does a VM on node2 reach a router on node1?
+What is a qrouter namespace?
 
-What happens if the router node dies?
+How does a VM on node2 reach a router hosted on another node?
+
+How does external traffic reach the physical LAN?
+
+What is router HA?
 
 What is DVR?
-```
 
-This guide assumes the conventional:
-
-```text
+How do I prove which layer is broken?
+This chapter focuses on the conventional learning model used by this lab:
 Neutron
 +
 ML2
 +
 Open vSwitch
 +
-Neutron L3 Agent
-```
-
-architecture used for this learning lab.
-
-In the current Kolla-Ansible configuration, the default Neutron plugin agent is:
-
-```text
-openvswitch
-```
-
-and both:
-
-```text
-Neutron DVR
-Neutron Agent HA
-```
-
-are disabled by default unless explicitly enabled.
-
----
-
-# 1. The Most Important Correction
-
-A Neutron router does NOT automatically run independently on every OpenStack node.
-
-Instead, the nodes can run:
-
-```text
-neutron-l3-agent
-```
-
-The L3 agent is capable of hosting Neutron routers.
-
-For example:
-
-```text
-node1
-├── neutron-l3-agent
-└── can host routers
-
-node2
-├── neutron-l3-agent
-└── can host routers
-
-node3
-├── neutron-l3-agent
-└── can host routers
-```
-
-But a particular router might actually be hosted on:
-
-```text
-node1
-```
-
-only.
-
----
-
-# 2. Small Memory Model
-
-Remember:
-
-```text
+Neutron agents
++
+Linux network namespaces
++
+VXLAN
+The detailed packet-by-packet view is in:
+docs/05-neutron-packet-walk.md
+The current physical dual-NIC design is documented in:
+docs/17-openstack-dual-nic-networking.md
+1. The Most Important Idea
+A Neutron router is not automatically a virtual machine.
+In the conventional L3-agent model, it is implemented using Linux networking constructs.
+A simplified picture is:
+Neutron API
+    |
+    v
 neutron-server
-    = controller / brain
+    |
+    v
+neutron-l3-agent
+    |
+    v
+qrouter namespace
+    |
+    +-- interfaces
+    +-- routes
+    +-- NAT
+    +-- neighbour state
+Memory:
+neutron-server
+    says WHAT should exist
 
 neutron-l3-agent
-    = router worker
+    implements the routing state
 
 qrouter namespace
-    = actual Linux routing environment
-```
-
-Or even shorter:
-
-```text
-Neutron Server
-    says WHAT
-
-L3 Agent
-    BUILDS it
-
-Linux namespace
-    ROUTES packets
-```
-
----
-
-# 3. Control Plane vs Data Plane
-
-This distinction is extremely important.
-
-## Control Plane
-
-The control plane decides:
-
-```text
-What should the network look like?
-```
-
+    actually routes packets
+2. Control Plane vs Data Plane
+This distinction is essential.
+Control plane
+The control plane describes and coordinates desired networking state.
 Examples:
-
-```text
 create network
-
 create subnet
-
 create router
-
-attach subnet to router
-
+attach subnet
+set external gateway
 associate Floating IP
-
 create security rule
-```
-
 Components include:
-
-```text
+Neutron API
 neutron-server
 database
 RabbitMQ
 Neutron agents
-```
-
----
-
-## Data Plane
-
-The data plane moves actual packets.
-
+Data plane
+The data plane actually moves packets.
 Examples:
-
-```text
-TAP interfaces
-
+VM virtual NIC
+TAP-style interfaces
 br-int
-
-VXLAN tunnels
-
+VXLAN
 router namespaces
-
 br-ex
-
-physical NICs
-```
-
+ext0
+physical LAN
 Important:
-
-```text
 VM packets do NOT pass through RabbitMQ.
-```
-
 RabbitMQ carries control/service messages.
+The real packet moves through Linux networking and Open vSwitch.
+3. Simple Architecture
+                    CONTROL PLANE
 
-Actual network traffic travels through Linux and OVS networking.
-
----
-
-# 4. Simple Diagram
-
-```text
-CONTROL PLANE
-
-User / OpenStack CLI
-        |
-        v
-  Neutron API
-        |
-        v
- neutron-server
-        |
-        | instructions
-        v
- Neutron Agents
+OpenStack CLI / Horizon / Terraform
+              |
+              v
+         Neutron API
+              |
+              v
+        neutron-server
+              |
+              v
+        Neutron agents
 
 
-DATA PLANE
+                     DATA PLANE
 
 VM
  |
-TAP
+TAP / Neutron port
  |
 br-int
  |
-VXLAN
+VXLAN if required
  |
 qrouter namespace
  |
 br-ex
  |
-physical network
-```
-
----
-
-# 5. What Does neutron-server Do?
-
-The Neutron server provides the Networking API.
-
-For example, the user requests:
-
-```bash
+ext0
+ |
+physical LAN
+This distinction becomes extremely useful during troubleshooting.
+4. What neutron-server Does
+neutron-server provides the Networking API and coordinates desired network state.
+For example:
 openstack router create router01
-```
-
-Neutron records the desired state.
-
-Conceptually:
-
-```text
+means conceptually:
 User:
-"I want router01."
+"I want router01 to exist."
 
         |
         v
 
-neutron-server:
-"Router router01 should exist."
-```
+Neutron:
+"Record router01 as desired state."
 
-The server does not itself need to forward every packet.
+        |
+        v
 
-Instead it coordinates agents which implement the desired networking state.
-
----
-
-# 6. What Does the L3 Agent Do?
-
-The:
-
-```text
-neutron-l3-agent
-```
-
-implements Layer 3 networking functions.
-
+Agents:
+"Implement the required Linux/OVS state."
+neutron-server does not need to forward every VM packet itself.
+5. What neutron-l3-agent Does
+The L3 agent implements Layer-3 networking functions.
 Think:
-
-```text
 routing
-NAT
 external gateway connectivity
+NAT
 Floating IP processing
-```
-
+router namespaces
 Simplified:
-
-```text
 neutron-server
       |
-      | instructions
       v
 neutron-l3-agent
       |
-      | creates/configures
       v
-Linux router namespace
-```
-
----
-
-# 7. What Is a Linux Network Namespace?
-
+qrouter namespace
+The agent is the worker.
+The namespace is the networking environment it builds and maintains.
+6. What Is a Linux Network Namespace?
 A Linux network namespace is an isolated networking environment.
-
-Each namespace can have its own:
-
-```text
+It can have its own:
 interfaces
-
 IP addresses
-
 routing table
-
-ARP table
-
-firewall rules
-
-NAT rules
-```
-
-Think of it as:
-
-```text
+neighbour table
+firewall/NAT state
+Think:
 a small isolated networking world inside Linux
-```
-
----
-
-# 8. Why Does Neutron Use Namespaces?
-
-Imagine two different OpenStack tenants.
-
-Tenant A:
-
-```text
+This allows many logical routers to coexist on one physical node.
+7. Why Namespaces Are Useful
+Imagine two tenants both use:
 10.10.10.0/24
-```
-
-Tenant B:
-
-```text
-10.10.10.0/24
-```
-
-They use the exact same IP range.
-
-Normally that would conflict.
-
-But separate namespaces allow:
-
-```text
+They can still have separate routers:
 qrouter-A
-    10.10.10.1
+    gateway 10.10.10.1
 
 qrouter-B
-    10.10.10.1
-```
-
-to coexist on the same physical host.
-
+    gateway 10.10.10.1
+because they live in isolated network namespaces.
 Conceptually:
-
-```text
 Linux Host
 
 +-----------------------+
 | qrouter-A             |
-|                       |
 | 10.10.10.1            |
 +-----------------------+
 
 +-----------------------+
 | qrouter-B             |
-|                       |
 | 10.10.10.1            |
 +-----------------------+
-```
-
-They are isolated from each other.
-
----
-
-# 9. Neutron Router Namespace
-
-After OpenStack is deployed, running:
-
-```bash
-ip netns
-```
-
-may show something similar to:
-
-```text
+The address overlap is possible because the networking environments are isolated.
+8. qrouter Namespace
+A router namespace commonly looks like:
+qrouter-<router-UUID>
+On a physical OpenStack node:
+sudo ip netns
+may show:
 qrouter-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-```
-
-That is a router namespace.
-
 The UUID corresponds to the OpenStack router.
-
----
-
-# 10. The Router Is Not a VM
-
-This is important.
-
-A Neutron router does not have to be a separate virtual machine.
-
-Instead:
-
-```text
-Linux Host
-    |
-    +-- network namespace
-           |
-           +-- interfaces
-           +-- routes
-           +-- NAT
-           +-- firewall
-```
-
-This makes Neutron routers lightweight.
-
-A single host can host many logical routers.
-
----
-
-# 11. Router Internal Interface
-
-A conventional Neutron router may have an interface resembling:
-
-```text
+9. qr and qg Interfaces
+Inside a router namespace, interfaces commonly resemble:
 qr-xxxxxxxx
-```
-
-Think:
-
-```text
-qr = router internal side
-```
-
-Example:
-
-```text
-private-net
-10.10.10.0/24
-      |
-      |
-qr-xxxx
-10.10.10.1
-      |
-+----------------+
-| qrouter        |
-+----------------+
-```
-
-The VM sees:
-
-```text
-10.10.10.1
-```
-
-as its default gateway.
-
----
-
-# 12. Router External Interface
-
-The router may also have an interface resembling:
-
-```text
 qg-xxxxxxxx
-```
+Memory:
+qr
+    router internal side
 
-Think:
-
-```text
-qg = gateway/external side
-```
-
+qg
+    router gateway/external side
 Conceptually:
-
-```text
-+----------------+
-| qrouter        |
-+----------------+
-      |
-    qg-xxxx
-      |
- external-net
-      |
-    br-ex
-```
-
----
-
-# 13. Complete Router Picture
-
-```text
-private-net
-10.10.10.0/24
-      |
+private network
       |
    qr-xxxx
       |
-      v
-+----------------------+
-| qrouter namespace    |
-|                      |
-| routing table        |
-| NAT                  |
-| firewall rules       |
-+----------------------+
++----------------+
+| qrouter        |
+| routing + NAT  |
++----------------+
       |
    qg-xxxx
       |
-      v
-external-net
-      |
-    br-ex
-      |
-physical network
-```
-
----
-
-# 14. Inside the Router
-
-Eventually we can inspect a router directly.
-
-First:
-
-```bash
-ip netns
-```
-
-Then:
-
-```bash
-ip netns exec qrouter-<UUID> ip addr
-```
-
-This shows the router interfaces.
-
----
-
-Its routes:
-
-```bash
-ip netns exec qrouter-<UUID> ip route
-```
-
-might conceptually look like:
-
-```text
-10.10.10.0/24 dev qr-xxxx
-
-default via 192.168.0.1 dev qg-xxxx
-```
-
-This is normal Linux routing.
-
----
-
-# 15. OpenStack Routing Is Still Linux Routing
-
-This is one of the most useful lessons.
-
-Neutron sounds complicated because it contains many services.
-
-But underneath, much of the networking is built from familiar Linux concepts:
-
-```text
-network namespaces
-
-interfaces
-
-bridges
-
-routes
-
-iptables/nftables
-
-NAT
-
-VXLAN
-
-Open vSwitch
-```
-
-Neutron automates and coordinates those pieces.
-
----
-
-# 16. Where Does a Router Run?
-
-Imagine we create:
-
-```text
-router01
-```
-
-and all three nodes have an L3 agent:
-
-```text
-node1
-node2
-node3
-```
-
-Neutron can schedule the router to one of those agents.
-
-For example:
-
-```text
-router01
+external network
+10. Router Internal Side
+Suppose the private subnet is:
+10.20.0.0/24
+and the VM gateway is:
+10.20.0.1
+The router internal side represents that gateway relationship.
+Conceptually:
+VM
+10.20.0.188
     |
     v
-node1
-```
-
-So:
-
-```text
-node1
-└── qrouter-router01
-
-node2
-└── no active router01
-
-node3
-└── no active router01
-```
-
-in a simple non-HA centralized architecture.
-
----
-
-# 17. But the VM Could Be on Another Node
-
-Imagine:
-
-```text
-router01
-    runs on node1
-
-ubuntu01
-    runs on node2
-```
-
-The VM still needs to use:
-
-```text
-router01
-```
-
-as its gateway.
-
-How?
-
-Overlay networking.
-
----
-
-# 18. Node-to-Node Overlay
-
-Simplified:
-
-```text
-NODE2
-
-ubuntu01
-   |
-  TAP
-   |
- br-int
-   |
-   |
-   | VXLAN
-   |
-========================
-   |
-   |
- br-int
-   |
+10.20.0.1
+    |
+ qr-xxxx
+    |
+ qrouter
+To the VM, this still looks like normal IP routing.
+11. Router External Side
+The router also needs a path toward the external/provider network.
+Conceptually:
 qrouter
    |
-NODE1
-```
+qg-xxxx
+   |
+external network
+   |
+br-ex
+   |
+ext0
+   |
+physical LAN
+In the current lab:
+ext0
+is the physical Layer-2 uplink used by br-ex.
+12. Current Physical External Path
+The current dual-NIC architecture is:
+MANAGEMENT / CONTROL / VXLAN
 
-The logical network spans the two physical servers.
+br-mgmt
+   |
+enp0s31f6
+   |
+physical LAN
+and separately:
+NEUTRON EXTERNAL
 
----
-
-# 19. Why VXLAN Exists
-
-Without an overlay, the VM network would have to exist physically everywhere.
-
-VXLAN allows OpenStack to create logical Layer 2 networks on top of an existing IP network.
-
-Conceptually:
-
-```text
-VM Ethernet frame
-       |
-       v
-VXLAN encapsulation
-       |
-       v
-normal IP network
-       |
-       v
-other OpenStack host
-```
-
----
-
-# 20. Underlay vs Overlay
-
-These two terms are useful.
-
-## Underlay
-
-The real physical network.
-
-In our lab:
-
-```text
-192.168.0.0/24
-```
-
-with physical Ethernet interfaces and switches.
-
----
-
-## Overlay
-
-The logical network created on top of it.
-
-Example:
-
-```text
-private-net
-10.10.10.0/24
-```
-
-carried between nodes using something such as:
-
-```text
-VXLAN
-```
-
----
-
-# 21. Diagram
-
-```text
-OVERLAY
-
-ubuntu01
-10.10.10.25
-      |
-      +======================+
-              VXLAN
-      +======================+
-                            |
-                      Neutron Router
-                      10.10.10.1
-
-
-UNDERLAY
+br-ex
+  |
+ext0
+  |
+physical LAN
+Kolla-Ansible uses:
+network_interface: "br-mgmt"
+neutron_external_interface: "ext0"
+This is the current design.
+13. Historical Single-NIC Path
+The original learning stage used:
+br-ex
+  |
+veth-ovs
+  ||
+veth-host
+  |
+br-mgmt
+  |
+enp0s31f6
+  |
+physical LAN
+That design was intentionally kept in:
+docs/03-openstack-single-nic-networking.md
+It remains useful for learning Linux bridges and veth pairs.
+It is not the current physical path of this homelab.
+14. Where Does a Router Run?
+A Neutron router is scheduled to one or more L3 agents depending on the configured routing model.
+In a simple centralized non-HA example:
+node1
+    qrouter-router01
 
 node2
-192.168.0.201
-      |
-physical network
-      |
+    no router01 namespace
+
+node3
+    no router01 namespace
+The fact that a node runs an L3 agent does not automatically mean every router is active there.
+15. Agent Exists vs Router Exists
+Do not confuse:
+neutron-l3-agent exists on node2
+with:
+router01 is hosted on node2
+They describe different things.
+Memory:
+L3 agent
+    capability / worker
+
+qrouter namespace
+    specific logical router implementation
+A rough VMware-style placement analogy is:
+L3 agent
+    host capable of running a workload
+
+qrouter
+    actual workload assigned there
+The analogy is not exact, but it helps.
+16. Find the Router From Hermes
+Start from the OpenStack control plane.
+Run on Hermes:
+openstack router list
+Inspect one router:
+openstack router show <router-name-or-UUID>
+Show its ports:
+openstack port list --router <router-name-or-UUID>
+This maps the logical router to its internal/external Neutron attachments.
+17. Find Which L3 Agent Hosts the Router
+From Hermes:
+openstack network agent list --agent-type l3
+For a particular router:
+openstack network agent list \
+  --router <router-name-or-UUID>
+This is much better than SSHing to every node and guessing.
+Once you know the host, inspect that node directly.
+18. Inspect the Router Namespace
+On the node hosting the router:
+sudo ip netns
+Then:
+sudo ip netns exec qrouter-<UUID> \
+  ip -br addr
+Inspect routing:
+sudo ip netns exec qrouter-<UUID> \
+  ip route
+Inspect neighbour state:
+sudo ip netns exec qrouter-<UUID> \
+  ip neigh
+At this point:
+OpenStack object
+has become:
+real Linux state
+19. OpenStack Routing Is Still Linux Routing
+This is one of the best lessons from Neutron.
+Underneath the OpenStack terminology are familiar Linux concepts:
+network namespaces
+interfaces
+routes
+ARP/neighbour discovery
+NAT
+firewall rules
+VXLAN
+Open vSwitch
+Neutron automates and coordinates these pieces.
+The more Linux networking you understand, the less mysterious Neutron becomes.
+20. VM and Router on Different Nodes
+Suppose:
+VM:
+node2
+
+router:
 node1
-192.168.0.200
-```
+The VM can still use that router because its Neutron network spans the physical hosts.
+Simplified:
+NODE2
 
-The overlay uses the underlay to transport packets.
+VM
+ |
+TAP
+ |
+br-int
+ |
+VXLAN
+ |
+============================
+ |
+VXLAN
+ |
+br-int
+ |
+qrouter
 
----
+NODE1
+The logical network is carried over the physical underlay.
+21. Underlay vs Overlay
+Underlay
+The actual physical IP network.
+In this lab:
+192.168.0.0/24
+The management/tunnel side uses:
+br-mgmt
+   |
+enp0s31f6
+Overlay
+The logical Neutron network carried across that physical network.
+Example:
+10.20.0.0/24
+using VXLAN.
+Memory:
+UNDERLAY
+    physical transport
 
-# 22. VMware / NSX Mental Model
-
-A rough comparison:
-
-```text
-OpenStack VXLAN
-      ~
-logical overlay networking
-```
-
-Similar conceptually to overlay networking used by NSX.
-
-You have:
-
-```text
+OVERLAY
+    logical tenant network
+22. VXLAN
+VXLAN allows Layer-2 tenant networks to span physical hosts.
+Very simplified:
+original VM Ethernet frame
+        |
+        v
+VXLAN encapsulation
+        |
+        v
+physical IP network
+        |
+        v
+remote OpenStack node
+VMware / NSX mental model:
 logical network
       |
 encapsulation
       |
-physical transport network
-```
-
-The technologies and implementations differ, but the mental model is useful.
-
----
-
-# 23. Packet Example
-
+physical transport
+The implementation differs, but the overlay concept is familiar.
+23. Example — VM to Internet
 Suppose:
-
-```text
-ubuntu01
-10.10.10.25
+VM:
 node2
-```
 
-runs:
+Fixed IP:
+10.20.0.188
 
-```bash
-ping 8.8.8.8
-```
-
-But:
-
-```text
-router01
-```
-
-is on:
-
-```text
-node1
-```
-
-The packet could conceptually travel:
-
-```text
-ubuntu01
-   |
-   v
-TAP
-   |
-   v
-br-int
-node2
-   |
-   | VXLAN
-   v
-physical network
-   |
-   v
-node1
-   |
-   v
-br-int
-   |
-   v
-qrouter-router01
-   |
-   v
-br-ex
-   |
-   v
-external network
-```
-
----
-
-# 24. Our Three-Node Architecture
-
-Our Kolla inventory currently uses:
-
-```text
-node1 = control + network + compute
-
-node2 = control + network + compute
-
-node3 = control + network + compute
-```
-
-So conceptually:
-
-```text
-        OPENSTACK THREE-NODE LAB
-
-NODE1             NODE2             NODE3
-
-control           control           control
-network           network           network
-compute           compute           compute
-```
-
-Each node can participate in multiple roles.
-
----
-
-# 25. Network Services on All Three Nodes
-
-Because all three nodes are in the:
-
-```ini
-[network]
-```
-
-group, Kolla may deploy relevant Neutron network agents across those nodes.
-
-Conceptually:
-
-```text
-NODE1
-├── OVS
-├── br-int
-├── br-ex
-└── Neutron agents
-
-NODE2
-├── OVS
-├── br-int
-├── br-ex
-└── Neutron agents
-
-NODE3
-├── OVS
-├── br-int
-├── br-ex
-└── Neutron agents
-```
-
-Exactly which agents run depends on the final Neutron configuration.
-
----
-
-# 26. Important: Agent Exists vs Router Exists
-
-Do not confuse:
-
-```text
-neutron-l3-agent exists on node2
-```
-
-with:
-
-```text
-router01 is actively hosted on node2
-```
-
-They are different statements.
-
-The L3 agent is:
-
-```text
-capability
-```
-
-The router namespace is:
-
-```text
-specific router instance
-```
-
----
-
-# 27. Easy Analogy
-
-Think:
-
-```text
-L3 Agent = ESXi host capable of running workload
-
-Router Namespace = actual workload assigned there
-```
-
-Not technically equivalent, but useful as a placement analogy.
-
----
-
-# 28. How Does Neutron Know Which Node Hosts the Router?
-
-Neutron keeps track of router-to-agent scheduling.
-
-Conceptually:
-
-```text
-router01
-      |
-      v
-L3 Agent on node1
-```
-
-The control plane knows:
-
-```text
-router01 should be implemented on node1
-```
-
-The L3 agent on node1 builds and maintains the required Linux networking objects.
-
----
-
-# 29. What Happens When the Router Configuration Changes?
-
-Suppose we add an external gateway.
-
-User:
-
-```text
-Set router01 gateway to external-net.
-```
-
-Conceptually:
-
-```text
-OpenStack CLI
-      |
-      v
-Neutron API
-      |
-      v
-neutron-server
-      |
-      v
-L3 agent
-      |
-      v
-modify qrouter namespace
-```
-
-The agent updates the Linux configuration.
-
----
-
-# 30. What Happens When a Floating IP Is Added?
-
-User associates:
-
-```text
-192.168.0.160
-```
-
-with:
-
-```text
-10.10.10.25
-```
-
-Conceptually:
-
-```text
-Neutron API
-     |
-     v
-neutron-server
-     |
-     v
-L3 agent
-     |
-     v
-NAT/networking rules
-```
-
-The control plane describes the desired relationship.
-
-The data plane implements it.
-
----
-
-# 31. What Happens If node1 Dies?
-
-Now we reach High Availability.
-
-Suppose:
-
-```text
-router01
-```
-
-is only active on:
-
-```text
-node1
-```
-
-and node1 fails.
-
-Without router HA, traffic using that router may be interrupted.
-
-Conceptually:
-
-```text
+router:
+hosted on another node
+The simplified path is:
 VM
  |
- v
-router01 on node1
+TAP / Neutron port
  |
- X   node1 died
+br-int
+ |
+VXLAN if router is remote
+ |
+qrouter
+ |
+NAT
+ |
+br-ex
+ |
+ext0
+ |
+physical LAN
  |
 Internet
-```
+The physical dual-NIC change affects the bottom of the path.
+The Neutron routing concepts remain the same.
+24. North-South vs East-West
+Two useful traffic directions:
+north-south
+    VM ↔ outside OpenStack
+Example:
+VM → Internet
+and:
+east-west
+    VM ↔ VM
+Example:
+VM-A → VM-B
+inside the cloud.
+25. Same Network, Same Host
+Suppose:
+VM-A
+10.20.0.25
 
-The router needs to be restored/rescheduled before connectivity returns.
-
----
-
-# 32. Neutron Agent HA
-
-Kolla has an option:
-
-```yaml
-enable_neutron_agent_ha: true
-```
-
-In the current Kolla-Ansible defaults, this is:
-
-```yaml
-false
-```
-
-unless explicitly enabled.
-
-For our learning lab we will decide deliberately whether to enable it rather than changing it blindly.
-
----
-
-# 33. Router HA Concept
-
-With L3 HA, the logical router can have router instances on multiple nodes.
-
+VM-B
+10.20.0.26
+and both are on the same Neutron subnet and same compute host.
 Conceptually:
-
-```text
-             router01
-
-NODE1           NODE2           NODE3
-
-qrouter         qrouter         qrouter
-ACTIVE          BACKUP          BACKUP
-```
-
-Only the active instance handles the main routing role at that moment.
-
----
-
-# 34. VRRP
-
-The router instances coordinate using:
-
-```text
-VRRP
-```
-
-Very simplified:
-
-```text
-NODE1
-router01
-ACTIVE
-
-       VRRP
-
+VM-A
+ |
+TAP
+ |
+br-int
+ |
+TAP
+ |
+VM-B
+A Layer-3 router is not required for two addresses on the same Layer-2 subnet.
+26. Same Network, Different Hosts
+Now place them on different nodes:
+VM-A on node2
+VM-B on node3
+Same Neutron network:
 NODE2
-router01
-BACKUP
 
-       VRRP
+VM-A
+ |
+br-int
+ |
+VXLAN
+ |
+====================
+ |
+VXLAN
+ |
+br-int
+ |
+VM-B
 
 NODE3
+The overlay extends the tenant network between hosts.
+27. Different Networks
+Suppose:
+VM-A
+10.10.10.25/24
+
+VM-B
+10.20.0.25/24
+Now Layer-3 routing is required.
+Conceptually:
+10.10.10.0/24
+       |
+       v
+ Neutron Router
+       |
+       v
+10.20.0.0/24
+This is normal routing expressed through Neutron.
+28. qdhcp Namespace
+Neutron can provide DHCP services using another namespace.
+You may see:
+qdhcp-<network-UUID>
+Do not confuse this with:
+qrouter-<router-UUID>
+Memory:
+qdhcp
+    provides DHCP
+
+qrouter
+    provides routing/NAT
+29. DHCP vs Router
+A simple memory hook:
+DHCP asks:
+"What network settings should the VM use?"
+
+Router asks:
+"Where should this packet go?"
+Different responsibilities.
+30. Floating IPs
+A Floating IP creates an externally reachable relationship to a VM fixed IP.
+Conceptually:
+192.168.0.153
+      |
+      | NAT
+      v
+10.20.0.188
+The current lab has validated this path using:
+ai-cirros-01
+with:
+Fixed IP:
+10.20.0.188
+
+Floating IP:
+192.168.0.153
+A post-cold-boot ping produced:
+4 transmitted
+4 received
+0% packet loss
+That proves the Neutron data plane remained functional after reboot.
+31. Inspect Floating IP State
+From Hermes:
+openstack floating ip list
+Inspect one:
+openstack floating ip show 192.168.0.153
+Then inspect the attached port:
+openstack port show <port-UUID>
+This connects:
+Floating IP
+    ↓
+Neutron port
+    ↓
+Fixed IP
+    ↓
+VM
+32. Router HA Concept
+High availability changes how router state is placed.
+A simplified HA model can look like:
 router01
-BACKUP
-```
 
-If the active router disappears, another can take over.
-
----
-
-# 35. Keepalived
-
-Neutron can use:
-
-```text
-Keepalived
-```
-
-to implement VRRP-based router HA.
-
-You have already seen Keepalived concepts before with an API VIP.
-
-Same broad principle:
-
-```text
-multiple systems
-       |
-shared logical address/state
-       |
-one active
-others standby
-```
-
----
-
-# 36. Router Failover
-
-Before failure:
-
-```text
 node1
-router01
 ACTIVE
 
 node2
-router01
 BACKUP
-```
 
-Then:
-
-```text
-node1 dies
-```
-
-Conceptually:
-
-```text
-node1                  node2
-
+node3
+BACKUP
+If the active router instance becomes unavailable, another instance can take over.
+This is conceptually different from a simple centralized non-HA router that exists on only one node.
+33. VRRP and Keepalived
+Neutron L3 HA can use:
+VRRP
+implemented with:
+Keepalived
+Simplified:
+router instance A
 ACTIVE
-  X
-                       BACKUP
-                          |
-                          v
-                       ACTIVE
-```
 
-Traffic can resume through node2.
+      VRRP
 
----
-
-# 37. API VIP HA vs Neutron Router HA
-
-Do not confuse these.
-
-Our OpenStack API VIP:
-
-```text
+router instance B
+BACKUP
+If the active instance fails:
+BACKUP
+   ↓
+ACTIVE
+The exact behavior depends on the Neutron configuration.
+34. API VIP HA Is Not Router HA
+Do not mix these concepts.
+The OpenStack API VIP:
 192.168.0.100
-```
-
-is for OpenStack service APIs.
-
+uses Keepalived to protect API access.
 Conceptually:
-
-```text
 OpenStack client
       |
 192.168.0.100
       |
-HAProxy / Keepalived
+Keepalived / HAProxy
       |
 OpenStack APIs
-```
-
----
-
-Neutron Router HA is different.
-
-It protects:
-
-```text
-VM network routing
-```
-
-Conceptually:
-
-```text
-VM
- |
-Neutron router
- |
-external network
-```
-
+Neutron router HA protects:
+VM routing
 So:
-
-```text
 API HA
-!=
-VM router HA
-```
-
----
-
-# 38. Two Different Keepalived Uses
-
-Conceptually:
-
-```text
-Keepalived use #1
-
-OpenStack API VIP
-192.168.0.100
-```
-
-and:
-
-```text
-Keepalived use #2
-
-Neutron L3 HA
-router redundancy
-```
-
-Same underlying HA technology concept, different purpose.
-
----
-
-# 39. What Is DVR?
-
+    !=
+Neutron router HA
+Same broad HA technology family.
+Different purpose.
+35. Current VIP Observation
+After the latest cold boot, the API VIP was observed on node2:
+node2 br-mgmt
+    192.168.0.201/24
+    192.168.0.100/32
+This proves the API VIP returned correctly after reboot.
+It does not by itself prove that Neutron router HA is enabled.
+That distinction is important.
+36. Do Not Assume HA Settings
+Do not infer Neutron router HA or DVR only because:
+all three nodes run network agents
+or because:
+all three nodes have br-ex
+Those observations prove that network functionality is deployed across the cluster.
+They do not automatically prove:
+every router is HA
+or:
+DVR is enabled
+Always confirm with actual Kolla configuration and OpenStack state.
+37. What Is DVR?
 DVR means:
-
-```text
 Distributed Virtual Routing
-```
-
-This changes how routing is distributed across the OpenStack environment.
-
----
-
-# 40. Traditional Centralized Routing
-
-Without DVR:
-
-```text
+Traditional centralized routing may require traffic to travel to the node hosting the router.
+DVR distributes routing functions closer to compute nodes for some traffic flows.
+38. Centralized Routing
+Simplified:
 VM on node2
       |
       v
@@ -1336,1032 +697,209 @@ br-int
       v
 node1
       |
-Neutron Router
+qrouter
       |
 br-ex
       |
-Internet
-```
-
-Traffic may need to travel to the node hosting the centralized router.
-
----
-
-# 41. Why Could That Be Inefficient?
-
-Imagine:
-
-```text
-VM-A on node2
-
-VM-B on node3
-```
-
-If routing is centralized, some traffic may need to travel through a network node.
-
+external network
+This is relatively easy to understand and observe.
+That makes it a strong learning model.
+39. DVR Idea
+With DVR, routing functions can be distributed closer to the compute nodes.
 Conceptually:
-
-```text
-node2
-VM-A
- |
- |
- v
 node1
-router
- |
- |
- v
+router components
+
+node2
+router components
+   |
+  VM
+
 node3
-VM-B
-```
-
-That can create:
-
-```text
-extra hops
-central bottlenecks
-larger failure domains
-```
-
----
-
-# 42. DVR Idea
-
-DVR distributes routing functions closer to compute nodes.
-
-Conceptually:
-
-```text
-NODE1
 router components
-
-NODE2
-router components
-    |
-   VM
-
-NODE3
-router components
-    |
-   VM
-```
-
-This reduces dependence on one centralized router location for certain traffic flows.
-
----
-
-# 43. Simplified DVR Traffic
-
-Instead of:
-
-```text
-VM node2
    |
-   v
-router node1
-   |
-   v
-VM node3
-```
-
-some routing can happen locally/distributed:
-
-```text
-VM node2
-   |
-distributed router functionality
-   |
-overlay
-   |
-VM node3
-```
-
-This can improve scalability.
-
----
-
-# 44. But DVR Adds Complexity
-
-DVR introduces additional concepts and components.
-
-Examples include:
-
-```text
+  VM
+This can reduce some centralized traffic paths.
+40. DVR Adds Complexity
+DVR introduces additional concepts.
+Examples can include:
 distributed router namespaces
-
 SNAT namespaces
-
 router components on compute hosts
-
-different L3 agent modes
-```
-
-So we are NOT starting with DVR.
-
----
-
-# 45. Current Kolla Default
-
-In the current Kolla configuration sample:
-
-```yaml
-enable_neutron_dvr: false
-```
-
-That is helpful for our learning lab.
-
-We can first understand conventional centralized routing.
-
-Later, DVR can become an advanced exercise.
-
----
-
-# 46. Why Start Simple?
-
-Our goal is:
-
-```text
-Understand first.
-
-Optimize second.
-```
-
-Starting with:
-
-```text
-centralized router
-+
-OVS
-+
-VXLAN
-```
-
-makes it easier to observe:
-
-```text
-where router lives
-where packet goes
-where NAT happens
-where br-ex connects
-```
-
-Then DVR will make much more sense later.
-
----
-
-# 47. Centralized vs DVR
-
-Simple comparison:
-
-| Feature | Centralized L3 | DVR |
-|---|---|---|
-| Easy to understand | Better | More complex |
-| Router concentrated on network nodes | Yes | Less |
-| Distributed routing on computes | No | Yes |
-| Good for learning | Excellent | Later |
-| More components | Fewer | More |
-
-For this homelab:
-
-```text
-Start centralized.
-```
-
----
-
-# 48. What About East-West Traffic?
-
-Two common traffic directions:
-
-```text
-north-south
-```
-
-means:
-
-```text
-VM ↔ outside OpenStack
-```
-
-For example:
-
-```text
-VM → Internet
-```
-
----
-
-```text
-east-west
-```
-
-means:
-
-```text
-VM ↔ VM
-```
-
-For example:
-
-```text
-VM-A → VM-B
-```
-
-inside the OpenStack cloud.
-
----
-
-# 49. Same Network, Same Host
-
-Imagine:
-
-```text
-VM-A
-10.10.10.25
-
-VM-B
-10.10.10.26
-```
-
-both on node2 and both on:
-
-```text
-private-net
-```
-
-Conceptually:
-
-```text
-VM-A
- |
-TAP
- |
-br-int
- |
-TAP
- |
-VM-B
-```
-
-No router is required because they are on the same Layer 2 subnet.
-
----
-
-# 50. Same Network, Different Hosts
-
-Now:
-
-```text
-VM-A on node2
-
-VM-B on node3
-```
-
-Same private network.
-
-Conceptually:
-
-```text
-NODE2
-
-VM-A
- |
-br-int
- |
-VXLAN
-====================
- |
-br-int
- |
-VM-B
-
-NODE3
-```
-
-Still no L3 router needed if they are in the same subnet.
-
-The overlay extends the Layer 2 network between hosts.
-
----
-
-# 51. Different Networks
-
-Suppose:
-
-```text
-VM-A
-10.10.10.25
-
-VM-B
-10.20.20.25
-```
-
-Now routing is required.
-
-Conceptually:
-
-```text
-10.10.10.0/24
-      |
-      v
-Neutron Router
-      |
-      v
-10.20.20.0/24
-```
-
-This is Layer 3 traffic.
-
----
-
-# 52. Router Namespace Routing Table
-
-Inside the router:
-
-```text
-10.10.10.0/24
-```
-
-might connect through:
-
-```text
-qr-interface-A
-```
-
-and:
-
-```text
-10.20.20.0/24
-```
-
-through:
-
-```text
-qr-interface-B
-```
-
-Conceptually:
-
-```text
-        qrouter
-
-10.10.10.1
-    |
-qr-A
-    |
-+----------------+
-| routing table  |
-+----------------+
-    |
-qr-B
-    |
-10.20.20.1
-```
-
-Again: normal routing concepts.
-
----
-
-# 53. Where Is DHCP?
-
-Neutron can also provide DHCP for tenant networks.
-
-The DHCP agent may use another namespace.
-
-You may see names similar to:
-
-```text
-qdhcp-<network-UUID>
-```
-
-This is separate from:
-
-```text
-qrouter-<router-UUID>
-```
-
----
-
-# 54. qrouter vs qdhcp
-
+different L3-agent modes
+For a learning lab, understanding conventional routing first is a good strategy.
 Memory:
-
-```text
-qrouter
-    routing / NAT
-
-qdhcp
-    DHCP services
-```
-
-These are different network namespaces with different jobs.
-
----
-
-# 55. Example
-
-```text
-private-net
-10.10.10.0/24
-```
-
-Could have:
-
-```text
-qdhcp namespace
-      |
-      | gives VM:
-      |
-      +-- IP 10.10.10.25
-      +-- gateway 10.10.10.1
-      +-- DNS
-```
-
-while:
-
-```text
-qrouter namespace
-      |
-      | provides:
-      |
-      +-- gateway 10.10.10.1
-      +-- routing
-      +-- NAT
-```
-
----
-
-# 56. DHCP vs Router
-
-Another memory shortcut:
-
-```text
-DHCP:
-"What IP should I use?"
-
-Router:
-"Where should this packet go?"
-```
-
-Very different responsibilities.
-
----
-
-# 57. Where Does br-ex Fit?
-
-The router's external side needs access to the provider/external network.
-
-That eventually reaches:
-
-```text
-br-ex
-```
-
-In our lab:
-
-```text
-qrouter
-   |
- qg-xxxx
-   |
- br-ex
-   |
-veth-ovs
-   ||
-veth-host
-   |
-br-mgmt
-   |
-enp0s31f6
-   |
-HOME LAN
-```
-
----
-
-# 58. Why Every Network Node Has veth-ovs
-
-Because all three nodes are currently:
-
-```text
-network nodes
-```
-
-we prepared:
-
-```text
-veth-ovs
-```
-
-on all three.
-
-That gives each node a potential path between:
-
-```text
-Neutron external networking
-```
-
-and:
-
-```text
-physical home LAN
-```
-
----
-
-# 59. Future Two-NIC Design
-
-Later our USB Ethernet adapters will simplify this.
-
-Instead of:
-
-```text
-br-ex
- |
-veth-ovs
- ||
-veth-host
- |
-br-mgmt
- |
-enp0s31f6
-```
-
-we can eventually have:
-
-```text
-Management NIC
-enp0s31f6
-    |
-192.168.0.20x
-```
-
-and separately:
-
-```text
-USB NIC
-   |
- br-ex
-   |
-Neutron external network
-```
-
-That is cleaner.
-
----
-
-# 60. One-NIC Design vs Two-NIC Design
-
-Current learning design:
-
-```text
-ONE PHYSICAL NIC
-
-management
-+
-external Neutron traffic
-
-share physical interface through bridge/veth
-```
-
-Future:
-
-```text
-TWO PHYSICAL NICs
-
-NIC1
-management/control
-
-NIC2
-Neutron external traffic
-```
-
-The two-NIC design is easier to reason about operationally.
-
----
-
-# 61. But the Single-NIC Design Is Valuable
-
-The single-NIC design forced us to understand:
-
-```text
-Linux bridges
-
-veth pairs
-
-interface ownership
-
-OVS external interface
-
-Neutron external connectivity
-```
-
-That is useful learning.
-
----
-
-# 62. Three-Node Packet Example
-
-Suppose:
-
-```text
-ubuntu01
-node2
-10.10.10.25
-
-router01
-node1
-
-Internet
-outside OpenStack
-```
-
-Full conceptual path:
-
-```text
-NODE2
-
-ubuntu01
-   |
- TAP
-   |
-br-int
-   |
-VXLAN
-   |
-===========================
-   |
-NODE1
-   |
-br-int
-   |
-qrouter-router01
-   |
-NAT
-   |
-br-ex
-   |
-veth-ovs
-   ||
-veth-host
-   |
-br-mgmt
-   |
-enp0s31f6
-   |
-HOME LAN
-   |
-Internet
-```
-
-That diagram is worth remembering.
-
----
-
-# 63. What Does the Neutron Server Manage?
-
-The Neutron server keeps track of logical objects such as:
-
-```text
-networks
-
-subnets
-
-ports
-
-routers
-
-Floating IPs
-
-security groups
-```
-
-It represents:
-
-```text
-desired networking state
-```
-
----
-
-# 64. What Do Agents Do?
-
-Agents translate desired state into actual host configuration.
-
-Conceptually:
-
-```text
-Neutron database:
-
-"router01 exists"
-       |
-       v
-Neutron agent:
-
-"build Linux networking needed for router01"
-```
-
-This is an important infrastructure automation concept.
-
----
-
-# 65. Desired State vs Actual State
-
-This idea will appear everywhere in modern infrastructure.
-
-```text
-Desired state:
-router01 should exist.
-
-Actual state:
-qrouter namespace and interfaces exist on node1.
-```
-
-Neutron tries to keep them aligned.
-
----
-
-# 66. Similar Idea in Kubernetes
-
-There is a loose conceptual similarity:
-
-```text
-Kubernetes:
-
-API desired state
-      |
-controllers
-      |
-actual resources
-```
-
-Neutron:
-
-```text
-Neutron API desired state
-      |
-agents
-      |
-actual networking
-```
-
-Not the same architecture, but the desired-state concept is useful.
-
----
-
-# 67. Why Agents Matter for Troubleshooting
-
-Suppose Horizon shows:
-
-```text
-router01
-ACTIVE
-```
-
-but packets do not flow.
-
-We may investigate the actual node:
-
-```text
-Which L3 agent owns router01?
-
-Does qrouter exist?
-
-Does its route table look correct?
-
-Does qg interface exist?
-
-Can the namespace reach the gateway?
-
-Is br-ex correct?
-```
-
-That moves troubleshooting from:
-
-```text
-"OpenStack networking is broken."
-```
-
-to:
-
-```text
-"Which layer is broken?"
-```
-
-Much better.
-
----
-
-# 68. Troubleshooting Layers
-
-A useful order:
-
-```text
-1. OpenStack object
-
-2. Neutron agent
-
-3. namespace
-
-4. interfaces
-
-5. routes
-
-6. NAT
-
-7. OVS bridges
-
-8. overlay
-
-9. physical network
-```
-
-Work from logical to physical.
-
----
-
-# 69. Example Troubleshooting
-
-VM cannot reach Internet.
-
-First:
-
-```text
-Does VM have an IP?
-```
-
-Then:
-
-```text
-Does VM have correct gateway?
-```
-
-Then:
-
-```text
-Does router exist?
-```
-
-Then:
-
-```text
-Which node hosts router?
-```
-
-Then:
-
-```text
-Does qrouter namespace exist?
-```
-
-Then:
-
-```text
-Does router have correct route?
-```
-
-Then:
-
-```text
-Does external gateway work?
-```
-
-Then:
-
-```text
-Does br-ex reach the LAN?
-```
-
-This is much better than randomly restarting containers.
-
----
-
-# 70. Commands We Will Use Later
-
-Once OpenStack is deployed:
-
-```bash
-openstack router list
-```
-
-shows logical routers.
-
----
-
-```bash
+Understand first.
+Optimize later.
+41. Centralized vs DVR
+Concept	Centralized routing	DVR
+Easier to visualize	Yes	More complex
+Router functions concentrated	More	Less
+Distributed routing on computes	No	Yes
+Good first learning model	Excellent	Advanced
+Operational complexity	Lower	Higher
+
+
+The purpose of this comparison is conceptual.
+Always inspect the actual deployment before assuming which mode is active.
+42. Neutron Agents
+Neutron agents turn desired configuration into host-level networking.
+Examples may include:
+L3 agent
+DHCP agent
+OVS agent
+metadata agent
+From Hermes:
 openstack network agent list
-```
+The current lab health check reports:
+12/12 Neutron agents alive and UP
+This is a useful control-plane health indicator.
+43. Agent Health Is Not the Whole Story
+This:
+12/12 Neutron agents UP
+is excellent.
+But it does not automatically prove:
+a Floating IP works
+or:
+a VM can reach the Internet
+That is why the lab also performs real data-plane tests.
+Think in layers:
+agent health
+    control-plane evidence
 
-shows networking agents.
+Floating-IP ping
+    data-plane evidence
+Both matter.
+44. Current br-ex State
+On each OpenStack node:
+sudo docker exec openvswitch_vswitchd \
+  ovs-vsctl list-ports br-ex
+currently shows:
+ext0
+phy-br-ex
+The important physical uplink is:
+ext0
+phy-br-ex is part of the OVS bridge-to-bridge connectivity.
+It is not another physical NIC.
+45. Inspect OVS Correctly in This Kolla Lab
+Open vSwitch runs inside Kolla containers.
+Use:
+sudo docker exec openvswitch_vswitchd \
+  ovs-vsctl show
+Inspect br-int:
+sudo docker exec openvswitch_vswitchd \
+  ovs-vsctl list-ports br-int
+Inspect br-ex:
+sudo docker exec openvswitch_vswitchd \
+  ovs-vsctl list-ports br-ex
+Do not assume that running ovs-vsctl directly on the host is the correct method in this deployment.
+46. Inspect All Nodes From Hermes
+From Hermes:
+for ip in 200 201 202; do
+  echo
+  echo "===== NODE $ip ====="
 
----
+  ssh openstack@192.168.0.$ip '
+    echo "--- Interfaces ---"
+    ip -br addr show br-mgmt
+    ip -br link show ext0
 
-```bash
-ip netns
-```
+    echo
+    echo "--- br-ex ---"
+    sudo docker exec openvswitch_vswitchd \
+      ovs-vsctl list-ports br-ex
+  '
+done
+The latest cold-boot validation confirmed:
+node1
+br-mgmt 192.168.0.200/24
+ext0 UP
 
-shows Linux network namespaces.
+node2
+br-mgmt 192.168.0.201/24
+VIP 192.168.0.100/32
+ext0 UP
 
----
+node3
+br-mgmt 192.168.0.202/24
+ext0 UP
+and all three returned:
+ext0
+phy-br-ex
+for br-ex.
+47. Router Troubleshooting Workflow
+If a VM cannot reach the Internet, do not immediately restart Neutron.
+Follow the path.
+Step 1 — VM
+Inside the VM:
+ip addr
+ip route
+Ask:
+Does it have the correct fixed IP?
 
-```bash
-ovs-vsctl show
-```
+Does it have the correct gateway?
+Step 2 — OpenStack objects
+From Hermes:
+openstack server show <server>
+openstack port list --server <server>
+openstack router list
+openstack router show <router>
+Ask:
+Does the VM port exist?
 
-shows OVS topology.
+Is the subnet attached to the router?
 
----
+Does the router have an external gateway?
+48. Find the Router Host
+From Hermes:
+openstack network agent list \
+  --router <router-name-or-UUID>
+Then SSH to the relevant host.
+Ask:
+Does the expected L3 agent exist?
 
-```bash
-ip -br addr
-```
-
-shows Linux interfaces.
-
----
-
-# 71. Inspect Router Namespace
-
-Example:
-
-```bash
-ip netns exec qrouter-<UUID> ip addr
-```
-
-Then:
-
-```bash
-ip netns exec qrouter-<UUID> ip route
-```
-
-This is where the architecture becomes real.
-
----
-
-# 72. Test Connectivity From Inside Router
-
-We may later do something such as:
-
-```bash
-ip netns exec qrouter-<UUID> ping -c 3 192.168.0.1
-```
-
-This answers:
-
-```text
-Can the Neutron router itself reach the physical gateway?
-```
-
-Extremely useful troubleshooting test.
-
----
-
-# 73. Why This Is Powerful
-
+Does the qrouter namespace exist?
+49. Test Inside the Router
+On the router host:
+sudo ip netns exec qrouter-<UUID> \
+  ip -br addr
+sudo ip netns exec qrouter-<UUID> \
+  ip route
+Then test the physical gateway:
+sudo ip netns exec qrouter-<UUID> \
+  ping -c 3 192.168.0.1
+This test is powerful.
 If:
-
-```text
-router namespace → gateway
-```
-
-works,
-
-but:
-
-```text
+router namespace → physical gateway
+works but:
 VM → Internet
-```
-
-doesn't,
-
-we have narrowed the problem.
-
-The issue is probably somewhere between:
-
-```text
-VM
-and
-router namespace
-```
-
-rather than external connectivity.
-
----
-
-# 74. Networking Troubleshooting Is Path Troubleshooting
-
-The packet has a path.
-
-Our job is to find where it stops.
-
+fails, then the external uplink is probably not the first place to investigate.
+50. Inspect NAT Carefully
+For investigation only, NAT state may be visible through an iptables-compatible view depending on the deployed Neutron implementation.
 Example:
-
-```text
+sudo ip netns exec qrouter-<UUID> \
+  iptables -t nat -S
+Do not manually edit Neutron-managed rules.
+The goal is:
+observe
+not:
+repair OpenStack by hand
+Manual changes can conflict with Neutron's desired state.
+51. Packet Capture
+When deeper troubleshooting is required:
+sudo tcpdump -ni ext0
+Watch ICMP:
+sudo tcpdump -ni ext0 icmp
+Watch a specific Floating IP:
+sudo tcpdump -ni ext0 host 192.168.0.153
+Packet capture answers:
+Did the packet reach this point?
+It does not automatically prove that the next hop works.
+52. Troubleshooting Is Path Troubleshooting
+A packet has a path.
+Your job is to find the first point where reality differs from the expected path.
+Example:
 VM
- ✅
- |
-TAP
  ✅
  |
 br-int
@@ -2370,24 +908,21 @@ br-int
 VXLAN
  ✅
  |
-router
+qrouter
  ✅
  |
 br-ex
+ ✅
+ |
+ext0
  ❌
  |
 LAN
-```
-
-Now we know where to investigate.
-
----
-
-# 75. VMware Troubleshooting Mental Model
-
-This is similar to checking:
-
-```text
+Now the failure domain is small.
+This is much better than saying:
+"Neutron is broken."
+53. VMware Troubleshooting Mental Model
+This is very similar to checking:
 VM NIC
    |
 Port Group
@@ -2399,159 +934,195 @@ uplink
 physical switch
    |
 router
-```
-
-OpenStack has more visible layers, but the troubleshooting philosophy is the same:
-
-```text
+In this OpenStack lab:
+VM vNIC
+   |
+Neutron port / TAP
+   |
+br-int
+   |
+VXLAN / router
+   |
+br-ex
+   |
+ext0
+   |
+physical LAN
+Different products.
+Same troubleshooting philosophy:
 follow the packet
-```
-
----
-
-# 76. What I Want to Remember
-
-The most important architecture:
-
-```text
-neutron-server
-      |
-      | CONTROL
-      v
+54. Desired State vs Actual State
+This is one of the most valuable concepts in the whole project.
+Desired state:
+router01 should exist
+Actual state:
+Neutron database entry
++
+scheduled L3 agent
++
+qrouter namespace
++
+interfaces
++
+routes
++
+NAT state
+Neutron agents try to keep actual state aligned with desired state.
+55. Why This Matters for Terraform
+Terraform also works with desired infrastructure state.
+For example:
+resource "openstack_networking_router_v2" "router" {
+  name = "router01"
+}
+Terraform says:
+I want this OpenStack router to exist.
+Terraform calls the OpenStack APIs.
+Neutron then implements the networking state.
+Conceptually:
+Terraform
+    |
+    v
+OpenStack API
+    |
+    v
+Neutron desired state
+    |
+    v
 Neutron agents
+    |
+    v
+Linux / OVS actual state
+This is an excellent bridge between OpenStack and Infrastructure as Code.
+56. Why This Matters for Ansible
+Ansible usually works at a different layer.
+For example:
+Terraform
+    creates VM
+
+Ansible
+    configures VM
+Or for the OpenStack hosts:
+Ansible
+    configures Linux prerequisites
+    networking
+    packages
+    files
+Kolla-Ansible itself demonstrates this model:
+desired configuration
       |
-      | BUILD
       v
-Linux / OVS networking
+Ansible tasks
       |
-      | FORWARDS
       v
-actual VM packets
-```
+actual Linux/container state
+Learning Neutron desired state helps reinforce why Ansible idempotency matters.
+57. Why This Matters for Hermes
+Hermes should not become an all-powerful root operator.
+A safer learning model is:
+Hermes
+    helps write/review IaC
+        |
+        v
+Terraform / Ansible
+        |
+        v
+human review
+        |
+        v
+controlled apply
+For OpenStack networking, Hermes can help:
+explain a Terraform plan
+generate Ansible tasks
+review configuration
+compare desired vs actual state
+suggest troubleshooting commands
+But high-impact operations should remain deliberate.
+This matches the security guardrails documented in:
+AI/HERMES-IAC-RULES.md
+58. Three Automation Layers
+A useful mental model for the next learning phase is:
+Terraform
+    creates cloud resources
 
----
+Ansible
+    configures operating systems / applications
 
-# 77. Router Memory Model
+Hermes
+    assists with authoring, review, explanation, and troubleshooting
+Example:
+Terraform
+    create network
+    create subnet
+    create router
+    create VM
+        |
+        v
+Ansible
+    install NGINX
+    configure web page
+        |
+        v
+Hermes
+    review the code
+    explain the plan
+    help troubleshoot safely
+This is where the homelab becomes a practical IaC platform.
+59. Current Healthy Baseline
+The current lab baseline is:
+Node reachability:
+3/3
 
-```text
-qrouter
-    = virtual router implemented in Linux namespace
+MariaDB:
+3/3 healthy
 
-qr-*
-    = router internal interface
+ProxySQL:
+3/3 healthy
 
-qg-*
-    = router external gateway interface
+Placement:
+3/3 healthy
 
-qdhcp
-    = DHCP namespace
-```
+Nova control:
+12/12 healthy
 
----
+Nova compute:
+3/3 enabled/up
 
-# 78. Multi-Node Memory Model
+Hypervisors:
+3/3 up
 
-```text
-VM on node2
-      |
-    br-int
-      |
-    VXLAN
-      |
-    br-int
-      |
-router on node1
-      |
-    br-ex
-      |
-     LAN
-```
+Neutron control:
+9/9 healthy
 
----
+Neutron agents:
+12/12 alive and UP
 
-# 79. HA Memory Model
+Keystone:
+authentication works
 
-Without HA:
+br-ex:
+ext0 + phy-br-ex on all nodes
 
-```text
-router01
-   |
-node1
-   |
-node1 dies
-   |
-routing interruption
-```
+Floating IP:
+validated after cold boot
 
-With HA:
-
-```text
-router01
-
-node1
-ACTIVE
-
-node2
-BACKUP
-
-node3
-BACKUP
-```
-
-If node1 dies:
-
-```text
-node2
-becomes ACTIVE
-```
-
----
-
-# 80. DVR Memory Model
-
-Traditional:
-
-```text
-VM
- |
-remote centralized router
- |
-outside
-```
-
-DVR:
-
-```text
-routing functionality distributed closer to compute nodes
-```
-
-For this lab:
-
-```text
-Learn centralized first.
-
-Study DVR later.
-```
-
----
-
-# 81. Final Cheat Sheet
-
-```text
+Overall:
+HEALTHY
+This is the state to preserve before intentional networking experiments.
+60. Router Memory Model
 neutron-server
     = NETWORK CONTROL PLANE
 
 neutron-l3-agent
-    = L3 WORKER
+    = ROUTER WORKER
 
 qrouter
-    = ACTUAL LINUX ROUTER ENVIRONMENT
+    = LINUX ROUTER ENVIRONMENT
 
 qr-*
-    = INTERNAL ROUTER SIDE
+    = ROUTER INTERNAL SIDE
 
 qg-*
-    = EXTERNAL ROUTER SIDE
+    = ROUTER EXTERNAL SIDE
 
 qdhcp
     = DHCP NAMESPACE
@@ -2562,116 +1133,122 @@ br-int
 br-ex
     = EXTERNAL OVS BRIDGE
 
+ext0
+    = CURRENT EXTERNAL PHYSICAL UPLINK
+
 VXLAN
     = HOST-TO-HOST OVERLAY
+61. HA Memory Model
+API VIP HA
+    protects OpenStack API access
+
+Neutron router HA
+    protects VM routing
 
 VRRP
-    = ROUTER HA ELECTION/FAILOVER
+    election/failover mechanism
 
 Keepalived
-    = IMPLEMENTS HA/VRRP FUNCTIONS
+    can implement VRRP-based HA
 
 DVR
-    = DISTRIBUTED VIRTUAL ROUTING
-```
-
----
-
-# 82. One-Sentence Explanation
-
-If someone asks:
-
-> How does a Neutron router work?
-
-A good answer is:
-
-```text
-Neutron's control plane tells L3 agents what logical routers should exist,
-and the agents implement those routers using Linux networking constructs,
-while OVS and overlay networking connect VMs and routers across physical hosts.
-```
-
----
-
-# 83. The Big Picture
-
-```text
-                         NEUTRON CONTROL PLANE
-
-                         neutron-server
-                               |
-                               |
-                +--------------+--------------+
-                |              |              |
-                v              v              v
-            L3 Agent       OVS Agent      DHCP Agent
-
-
-                         NETWORK DATA PLANE
-
- NODE1                     NODE2                     NODE3
-
-+---------+               +---------+               +---------+
-| br-int  |===============| br-int  |===============| br-int  |
-|    |    |    VXLAN      |    |    |    VXLAN      |    |    |
-| qrouter |               |   VMs   |               |   VMs   |
-|    |    |               |         |               |         |
-| br-ex   |               | br-ex   |               | br-ex   |
-+----+----+               +----+----+               +----+----+
-     |                         |                         |
-     +-------------------------+-------------------------+
-                               |
-                            HOME LAN
-```
-
-That is the picture to carry into the Kolla deployment.
-
----
-
-# 84. What Comes Next
-
-After deployment we will stop talking hypothetically.
-
-We will inspect the real environment:
-
-```bash
+    distributes routing functionality
+Do not assume a feature is enabled merely because you understand the concept.
+Always verify the actual configuration.
+62. Multi-Node Memory Model
+VM on node2
+      |
+    br-int
+      |
+    VXLAN
+      |
+    br-int
+      |
+qrouter on another node
+      |
+    br-ex
+      |
+     ext0
+      |
+     LAN
+This is the picture to carry into troubleshooting.
+63. Useful Commands — Hermes
+Logical OpenStack state:
+openstack router list
+openstack router show <router>
+openstack port list --router <router>
 openstack network agent list
-```
+openstack network agent list --agent-type l3
+openstack network agent list --router <router>
+openstack floating ip list
+These commands answer:
+What does OpenStack think should exist?
+64. Useful Commands — OpenStack Node
+Actual Linux state:
+sudo ip netns
+sudo ip netns exec qrouter-<UUID> \
+  ip -br addr
+sudo ip netns exec qrouter-<UUID> \
+  ip route
+sudo ip netns exec qrouter-<UUID> \
+  ip neigh
+Actual OVS state:
+sudo docker exec openvswitch_vswitchd \
+  ovs-vsctl show
+sudo docker exec openvswitch_vswitchd \
+  ovs-vsctl list-ports br-ex
+These commands answer:
+What actually exists on Linux right now?
+65. The Big Troubleshooting Question
+When OpenStack networking fails, compare:
+DESIRED STATE
+with:
+ACTUAL STATE
+Example:
+OpenStack says:
+router01 exists
 
-then:
+but Linux says:
+qrouter namespace missing
+Now you have a meaningful failure.
+That is far more useful than:
+"Networking doesn't work."
+66. Final One-Sentence Explanation
+If someone asks:
+How does a Neutron router work?
 
-```bash
-ip netns
-```
+A strong answer is:
+Neutron's control plane records the desired logical router,
+Neutron agents implement that router using Linux networking
+and Open vSwitch, and the resulting namespaces, routes,
+NAT state, overlays, and external bridge move the actual packets.
+67. Final Lesson
+Neutron looks complicated because it exposes many layers.
+But those layers become manageable when you separate them:
+OpenStack object
+      |
+      v
+Neutron control plane
+      |
+      v
+Neutron agent
+      |
+      v
+Linux namespace / OVS
+      |
+      v
+physical network
+For troubleshooting:
+follow the packet
+For automation:
+understand desired state
+For the next phase of this homelab:
+Terraform
+    creates infrastructure
 
-then:
+Ansible
+    configures systems
 
-```bash
-ovs-vsctl show
-```
-
-then enter the router itself:
-
-```bash
-ip netns exec qrouter-<UUID> ip addr
-```
-
-and:
-
-```bash
-ip netns exec qrouter-<UUID> ip route
-```
-
-At that point:
-
-```text
-diagram
-```
-
-becomes:
-
-```text
-actual Linux networking
-```
-
-and the concepts should become much easier to remember.
+Hermes
+    helps you understand and safely automate both
+That is where OpenStack becomes the platform for learning IaC rather than the final destination.
