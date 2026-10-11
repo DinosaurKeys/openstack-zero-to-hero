@@ -314,6 +314,21 @@ dedicated Neutron external NIC
 
 This is the current network architecture.
 
+### 18 — Heat Retirement and RabbitMQ Cleanup
+
+`docs/18-heat-retirement-and-rabbitmq-cleanup.md`
+
+Documents the verified Heat shutdown, cleanup of thousands of
+unused RabbitMQ queues, and fresh-build precautions.
+
+### 19 — OpenStack Live Migration
+
+[OpenStack Live Migration vs VMware vMotion](docs/19-openstack-live-migration.md)
+
+Documents the successful node2-to-node1 block live migration.
+
+---
+
 ### OpenStack Reboot and Recovery Runbook
 
 ```text

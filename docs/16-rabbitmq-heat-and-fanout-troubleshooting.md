@@ -1,5 +1,11 @@
 # RabbitMQ, Heat, and Stream Fanout Troubleshooting
 
+> **Later incident (9–10 October 2026):**
+> A subsequent Heat retirement and cleanup removed another
+> large population of empty Heat-related quorum queues.
+> See [Chapter 18](18-heat-retirement-and-rabbitmq-cleanup.md).
+> The historical measurements in this chapter remain preserved.
+
 This chapter documents a real RabbitMQ memory incident in the three-node
 Kolla-Ansible OpenStack homelab.
 

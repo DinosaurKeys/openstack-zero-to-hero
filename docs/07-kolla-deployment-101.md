@@ -1000,6 +1000,18 @@ The two tools solve related automation problems from different ecosystems.
 
 ---
 
+## Heat deployment tweak for the current homelab
+
+For a fresh build where Terraform is the orchestration tool and
+Heat is unnecessary, use `enable_heat: "no"` before deployment.
+
+Existing Heat systemd units and durable RabbitMQ queues may
+survive a later configuration change. See
+[Chapter 18](18-heat-retirement-and-rabbitmq-cleanup.md)
+for the verified retirement procedure.
+
+---
+
 # 28. Horizon
 
 Horizon is the OpenStack web dashboard.
