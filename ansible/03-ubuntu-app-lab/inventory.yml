@@ -1,0 +1,9 @@
+all:
+  children:
+    web:
+      hosts:
+        web-01:
+          ansible_host: 192.168.0.169
+          ansible_user: ubuntu
+          ansible_ssh_private_key_file: ~/.ssh/openstack-lab-vm
+          ansible_python_interpreter: /usr/bin/python3.12

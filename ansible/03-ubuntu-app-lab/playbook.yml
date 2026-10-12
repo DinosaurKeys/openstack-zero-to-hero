@@ -1,0 +1,37 @@
+---
+- name: Configure web server
+  hosts: web
+  become: true
+
+  tasks:
+    - name: Update APT package cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install NGINX
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+
+    - name: Enable and start NGINX service
+      ansible.builtin.systemd:
+        name: nginx
+        enabled: true
+        state: started
+
+    - name: Deploy welcome page
+      ansible.builtin.copy:
+        dest: /var/www/html/index.html
+        content: |
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Welcome</title>
+          </head>
+          <body>
+              <h1>OpenStack + Terraform + Ansible + Hermes</h1>
+              <p>This page was deployed by Ansible on web-01</p>
+          </body>
+          </html>
+        mode: "0644"
