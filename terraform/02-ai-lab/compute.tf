@@ -17,6 +17,10 @@ resource "openstack_compute_instance_v2" "vm" {
   network {
     uuid = openstack_networking_network_v2.private.id
   }
+
+  depends_on = [
+    openstack_networking_subnet_v2.private
+  ]
 }
 
 resource "openstack_compute_instance_v2" "vm2" {
@@ -33,6 +37,10 @@ resource "openstack_compute_instance_v2" "vm2" {
   network {
     uuid = openstack_networking_network_v2.private.id
   }
+
+  depends_on = [
+    openstack_networking_subnet_v2.private
+  ]
 
   metadata = {
     environment = "ai-lab"
