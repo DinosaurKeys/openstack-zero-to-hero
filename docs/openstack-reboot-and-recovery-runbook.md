@@ -556,6 +556,63 @@ Alive = :-)
 State = UP
 ```
 
+## 13.1 Manual recovery — Quick reference
+
+If `lab-recover.sh --apply` does not restore a service:
+
+### 1. Identify the failed component
+
+```bash
+./scripts/lab-status.sh
+openstack compute service list
+openstack network agent list
+```
+
+### 2. Inspect the affected service
+
+Example: node3 Neutron L3 agent.
+
+```bash
+ssh openstack@192.168.0.202 \
+  'sudo systemctl status kolla-neutron_l3_agent-container.service --no-pager'
+
+ssh openstack@192.168.0.202 \
+  'sudo journalctl -u kolla-neutron_l3_agent-container.service -n 40 --no-pager'
+```
+
+### 3. Restart only the affected service if appropriate
+
+```bash
+ssh openstack@192.168.0.202 \
+  'sudo systemctl restart kolla-neutron_l3_agent-container.service'
+```
+
+Common Kolla service names:
+
+| Component | Service name |
+|---|---|
+| Nova Compute | `nova_compute` |
+| Nova Conductor | `nova_conductor` |
+| Nova Scheduler | `nova_scheduler` |
+| Neutron L3 | `neutron_l3_agent` |
+| Neutron DHCP | `neutron_dhcp_agent` |
+| Neutron OVS | `neutron_openvswitch_agent` |
+
+Systemd unit pattern: `kolla-SERVICE-container.service`.
+
+Replace the service and host with the affected component.
+Do not blindly restart healthy services. Restarts may interrupt
+VM or network operations.
+
+### 4. Verify recovery
+
+```bash
+./scripts/lab-status.sh
+```
+
+Target: `RESULT: HEALTHY`, 14/14 checks passing.
+
+
 ---
 
 # 14. If one nova-compute is DOWN
@@ -1325,6 +1382,24 @@ PASS checks: 14
 ```
 
 ---
+## Cold-boot Step 5: Neutron L3 recovery example
+
+12 October 2026: node3 L3 agent showed `Alive=XXX`,
+while the rest of the cluster was mostly healthy.
+
+The operator restarted only the affected container:
+
+```bash
+ssh openstack@192.168.0.202 \
+  'sudo docker restart neutron_l3_agent'
+```
+
+Result: `Alive=:-)` and `State=UP`.
+
+See Section 13.1 for the general manual recovery procedure.
+
+---
+
 # 24. RabbitMQ / Nova RPC last-resort recovery
 
 A separate failure was observed where MariaDB and the main control plane
