@@ -1,0 +1,32 @@
+---
+- name: Configure database server
+  hosts: db
+  become: true
+
+  tasks:
+    - name: Update APT package cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install PostgreSQL and client
+      ansible.builtin.apt:
+        name:
+          - postgresql
+          - postgresql-client
+        state: present
+
+    - name: Enable and start PostgreSQL service
+      ansible.builtin.systemd:
+        name: postgresql
+        enabled: true
+        state: started
+
+    - name: Verify PostgreSQL is ready (read-only)
+      ansible.builtin.command: pg_isready -h 127.0.0.1
+      register: pg_ready
+      changed_when: false
+
+    - name: Display PostgreSQL readiness
+      ansible.builtin.debug:
+        msg: "PostgreSQL ready: {{ pg_ready.rc == 0 }}"

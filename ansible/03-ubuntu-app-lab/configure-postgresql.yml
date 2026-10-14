@@ -1,0 +1,88 @@
+---
+- name: Configure PostgreSQL network access and authentication
+  hosts: db
+  become: true
+
+  tasks:
+    - name: Install PostgreSQL automation prerequisites
+      ansible.builtin.apt:
+        name:
+          - acl
+          - python3-psycopg2
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Set postgresql.conf listen_addresses to localhost and db-01 IP
+      ansible.builtin.lineinfile:
+        path: /etc/postgresql/16/main/postgresql.conf
+        regexp: '^#?\s*listen_addresses\s*='
+        line: "listen_addresses = 'localhost,10.20.0.197'"
+        state: present
+      register: pg_conf_listen
+      notify: restart postgresql
+
+    - name: Ensure pg_hba.conf allows appuser from web-01 IP to appdb with scram-sha-256
+      ansible.builtin.lineinfile:
+        path: /etc/postgresql/16/main/pg_hba.conf
+        regexp: '^host\s+appdb\s+appuser\s+10\.20\.0\.15/32\s+'
+        line: 'host    appdb           appuser         10.20.0.15/32               scram-sha-256'
+        state: present
+      register: pg_hba_app
+      notify: restart postgresql
+
+    - name: Flush handlers to apply configuration changes before verification
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify active listen_addresses setting (read-only)
+      community.postgresql.postgresql_query:
+        login_db: postgres
+        query: "SHOW listen_addresses;"
+      register: pg_listen_verify
+      become: true
+      become_user: postgres
+      changed_when: false
+
+    - name: Verify pg_hba_file_rules has no errors (read-only)
+      community.postgresql.postgresql_query:
+        login_db: postgres
+        query: |
+          SELECT rule_number, database, user_name, address, auth_method, error
+          FROM pg_hba_file_rules
+          WHERE error IS NOT NULL;
+      register: pg_hba_verify
+      become: true
+      become_user: postgres
+      changed_when: false
+
+    - name: Assert listen_addresses is correct
+      ansible.builtin.assert:
+        that:
+          - "pg_listen_verify.query_result[0].listen_addresses == 'localhost,10.20.0.197'"
+        fail_msg: "listen_addresses not set correctly"
+        success_msg: "listen_addresses verified: localhost,10.20.0.197"
+      changed_when: false
+
+    - name: Assert pg_hba_file_rules has no errors
+      ansible.builtin.assert:
+        that:
+          - "pg_hba_verify.query_result | length == 0"
+        fail_msg: "pg_hba.conf configuration errors found: {{ pg_hba_verify.query_result }}"
+        success_msg: "pg_hba_file_rules verified: no errors"
+      changed_when: false
+
+    - name: Display configuration summary
+      ansible.builtin.debug:
+        msg:
+          - "listen_addresses configured: {{ pg_conf_listen.changed }}"
+          - "pg_hba.conf appdb/appuser rule: {{ pg_hba_app.changed }}"
+          - "PostgreSQL restarted: {{ pg_conf_listen.changed or pg_hba_app.changed }}"
+          - "Active listen_addresses: {{ pg_listen_verify.query_result[0].listen_addresses }}"
+          - "pg_hba_file_rules errors: {{ pg_hba_verify.query_result | length }}"
+      changed_when: false
+
+  handlers:
+    - name: restart postgresql
+      ansible.builtin.systemd:
+        name: postgresql
+        state: restarted

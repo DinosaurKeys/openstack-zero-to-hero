@@ -51,3 +51,4 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+ansible/03-ubuntu-app-lab/db-secrets.yml

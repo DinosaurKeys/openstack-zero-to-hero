@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>OpenStack Task Manager</title>
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 2rem auto; padding: 0 1rem; }
+        h1 { color: #333; }
+        .task-list { list-style: none; padding: 0; }
+        .task { display: flex; align-items: center; padding: 0.75rem; border-bottom: 1px solid #eee; gap: 0.5rem; }
+        .task:last-child { border-bottom: none; }
+        .task.completed .task-title { text-decoration: line-through; color: #999; }
+        .task-title { flex: 1; word-break: break-word; }
+        .task-form { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; }
+        .task-form input[type="text"] { flex: 1; padding: 0.5rem; font-size: 1rem; }
+        .task-form button, .btn { padding: 0.5rem 1rem; font-size: 0.9rem; cursor: pointer; border: none; border-radius: 4px; }
+        .btn-add { background: #28a745; color: white; }
+        .btn-toggle { background: #007bff; color: white; }
+        .btn-delete { background: #dc3545; color: white; }
+        .btn:hover { opacity: 0.9; }
+        .empty { color: #666; font-style: italic; text-align: center; padding: 2rem; }
+    </style>
+</head>
+<body>
+    <h1>OpenStack Task Manager</h1>
+
+    <form class="task-form" action="{{ url_for('add_task') }}" method="post">
+        <input type="text" name="title" placeholder="Add a new task..." required>
+        <button type="submit" class="btn btn-add">Add</button>
+    </form>
+
+    {% if tasks %}
+    <ul class="task-list">
+        {% for task in tasks %}
+        <li class="task {% if task[2] %}completed{% endif %}">
+            <span class="task-title">{{ task[1] }}</span>
+            <form action="{{ url_for('toggle_task', task_id=task[0]) }}" method="post" style="margin: 0;">
+                <button type="submit" class="btn btn-toggle">
+                    {% if task[2] %}Undo{% else %}Done{% endif %}
+                </button>
+            </form>
+            <form action="{{ url_for('delete_task', task_id=task[0]) }}" method="post" style="margin: 0;">
+                <button type="submit" class="btn btn-delete">Delete</button>
+            </form>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No tasks yet. Add one above!</p>
+    {% endif %}
+
+    <p><a href="/health">Health check</a></p>
+</body>
+</html>

@@ -1,0 +1,204 @@
+---
+- name: Deploy Flask Task Manager
+  hosts: web
+  become: true
+  vars_files:
+    - db-secrets.yml
+
+  vars:
+    app_name: task-manager
+    app_user: taskmgr
+    app_dir: "/opt/{{ app_name }}"
+    venv_dir: "{{ app_dir }}/venv"
+    gunicorn_bind: "127.0.0.1:5000"
+    gunicorn_workers: 3
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart task-manager service
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        state: restarted
+
+    - name: Reload NGINX
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+
+  tasks:
+    - name: Install Python virtual environment prerequisites
+      ansible.builtin.apt:
+        name:
+          - python3-venv
+          - python3-pip
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create dedicated application system user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: "{{ app_dir }}"
+        create_home: false
+        comment: "Flask Task Manager application user"
+
+    - name: Create application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0750"
+
+    - name: Copy app.py
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../apps/task-manager/app.py"
+        dest: "{{ app_dir }}/app.py"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0644"
+      notify: Restart task-manager service
+
+    - name: Copy requirements.txt
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../apps/task-manager/requirements.txt"
+        dest: "{{ app_dir }}/requirements.txt"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0644"
+      notify: Restart task-manager service
+
+    - name: Create templates directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}/templates"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0750"
+
+    - name: Deploy templates/index.html
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../apps/task-manager/templates/index.html"
+        dest: "{{ app_dir }}/templates/index.html"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0644"
+      notify: Restart task-manager service
+
+    - name: Create Python virtual environment
+      ansible.builtin.command: "python3 -m venv {{ venv_dir }}"
+      args:
+        creates: "{{ venv_dir }}/bin/activate"
+
+    - name: Install Flask from requirements.txt in virtual environment
+      ansible.builtin.pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ venv_dir }}"
+      notify: Restart task-manager service
+
+    - name: Install Gunicorn in virtual environment
+      ansible.builtin.pip:
+        name: gunicorn
+        virtualenv: "{{ venv_dir }}"
+      notify: Restart task-manager service
+
+    - name: Create /etc directory for EnvironmentFile
+      ansible.builtin.file:
+        path: "/etc/{{ app_name }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Deploy EnvironmentFile with DB credentials
+      ansible.builtin.template:
+        src: task-manager.env.j2
+        dest: "/etc/{{ app_name }}/task-manager.env"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      notify:
+        - Reload systemd
+        - Restart task-manager service
+
+    - name: Deploy systemd service unit
+      ansible.builtin.template:
+        src: task-manager.service.j2
+        dest: "/etc/systemd/system/{{ app_name }}.service"
+        mode: "0644"
+      notify:
+        - Reload systemd
+        - Restart task-manager service
+
+    - name: Flush handlers to ensure systemd daemon-reload runs before service start
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start task-manager service
+      ansible.builtin.systemd:
+        name: "{{ app_name }}"
+        enabled: true
+        state: started
+
+    - name: Deploy NGINX site configuration
+      ansible.builtin.template:
+        src: task-manager.nginx.j2
+        dest: "/etc/nginx/sites-available/{{ app_name }}"
+        mode: "0644"
+      notify: Reload NGINX
+
+    - name: Enable NGINX site
+      ansible.builtin.file:
+        src: "/etc/nginx/sites-available/{{ app_name }}"
+        dest: "/etc/nginx/sites-enabled/{{ app_name }}"
+        state: link
+        force: true
+      notify: Reload NGINX
+
+    - name: Disable NGINX default site
+      ansible.builtin.file:
+        path: "/etc/nginx/sites-enabled/default"
+        state: absent
+      notify: Reload NGINX
+
+    - name: Validate NGINX configuration
+      ansible.builtin.command: nginx -t
+      register: nginx_test
+      changed_when: false
+      failed_when: nginx_test.rc != 0
+
+    - name: Flush handlers to ensure NGINX reload completes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify Flask health endpoint directly via Gunicorn
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:5000/health"
+        method: GET
+        return_content: true
+        status_code: 200
+      register: health_check_gunicorn
+      retries: 10
+      delay: 3
+      until: health_check_gunicorn.json.status == "ok"
+
+    - name: Verify Flask health endpoint via NGINX proxy
+      ansible.builtin.uri:
+        url: "http://127.0.0.1/health"
+        method: GET
+        return_content: true
+        status_code: 200
+      register: health_check_nginx
+      retries: 10
+      delay: 3
+      until: health_check_nginx.json.status == "ok"
+
+    - name: Display health check results
+      ansible.builtin.debug:
+        msg:
+          - "Gunicorn /health: {{ health_check_gunicorn.json }}"
+          - "NGINX  /health: {{ health_check_nginx.json }}"

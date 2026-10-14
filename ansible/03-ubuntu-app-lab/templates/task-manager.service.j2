@@ -1,0 +1,22 @@
+[Unit]
+Description=Flask Task Manager (Gunicorn)
+After=network.target
+
+[Service]
+Type=notify
+User={{ app_user }}
+Group={{ app_user }}
+WorkingDirectory={{ app_dir }}
+Environment=PATH={{ venv_dir }}/bin
+EnvironmentFile=/etc/{{ app_name }}/task-manager.env
+ExecStart={{ venv_dir }}/bin/gunicorn \
+    --bind {{ gunicorn_bind }} \
+    --workers {{ gunicorn_workers }} \
+    --access-logfile - \
+    --error-logfile - \
+    app:app
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

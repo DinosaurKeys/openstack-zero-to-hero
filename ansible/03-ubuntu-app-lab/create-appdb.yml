@@ -1,0 +1,59 @@
+---
+- name: Create application database and user
+  hosts: db
+  become: true
+  vars_files:
+    - db-secrets.yml
+
+  pre_tasks:
+    - name: Install PostgreSQL automation prerequisites
+      ansible.builtin.apt:
+        name:
+          - acl
+          - python3-psycopg2
+        state: present
+
+  tasks:
+    - name: Create PostgreSQL login role appuser
+      community.postgresql.postgresql_user:
+        name: appuser
+        password: "{{ vault_app_db_password }}"
+        role_attr_flags: "LOGIN,NOSUPERUSER,NOCREATEDB,NOCREATEROLE"
+        state: present
+      become: true
+      become_user: postgres
+      no_log: true
+
+    - name: Create application database appdb owned by appuser
+      community.postgresql.postgresql_db:
+        name: appdb
+        owner: appuser
+        state: present
+      become: true
+      become_user: postgres
+
+    - name: Gather PostgreSQL databases and roles info (read-only)
+      community.postgresql.postgresql_info:
+        filter:
+          - databases
+          - roles
+      register: pg_info
+      become: true
+      become_user: postgres
+      changed_when: false
+
+    - name: Verify appdb exists
+      ansible.builtin.assert:
+        that:
+          - "'appdb' in pg_info.databases"
+        fail_msg: "Database appdb not found"
+        success_msg: "Database appdb verified"
+      changed_when: false
+
+    - name: Verify appuser exists
+      ansible.builtin.assert:
+        that:
+          - "'appuser' in pg_info.roles"
+        fail_msg: "Role appuser not found"
+        success_msg: "Role appuser verified"
+      changed_when: false
