@@ -84,13 +84,14 @@ A **two-tier application**:
 ## 4. Deployment Order (Chronological)
 
 ```
-Step 1: Terraform → Create infrastructure
-Step 2: Ansible   → Configure PostgreSQL
-Step 3: Ansible   → Create database & user
-Step 4: Ansible   → Create tasks table
-Step 5: Ansible   → Configure PostgreSQL network access
-Step 6: Ansible   → Deploy Flask app (Gunicorn + NGINX)
-Step 7: Verify    → Health checks, end-to-end test
+Step 1: Terraform      → Create infrastructure
+Step 2: Ansible        → Configure PostgreSQL base (db-playbook.yml)
+Step 3: Ansible        → Create database & user (create-appdb.yml)
+Step 4: Ansible        → Create tasks table (create-tasks-table.yml)
+Step 5: Ansible        → Configure PostgreSQL network access (configure-postgresql.yml)
+Step 6: Ansible        → Install NGINX base (playbook.yml)
+Step 7: Ansible        → Deploy Flask app (deploy-task-manager.yml)
+Step 8: Verify         → Health checks, end-to-end test
 ```
 
 Each step builds on the previous. Run in order.
@@ -243,7 +244,43 @@ ansible-playbook -i inventory.yml configure-postgresql.yml
 
 ---
 
-## 10. Step 6 — Ansible: Deploy Flask Application
+## 10. Step 6 — Ansible: Install NGINX Base
+
+**Playbook:** `ansible/03-ubuntu-app-lab/playbook.yml`
+
+### What It Does
+
+```yaml
+- Update APT package cache
+- Install NGINX
+- Enable and start NGINX service
+- Deploy welcome page (verifies NGINX serves traffic)
+```
+
+### Why This Step Is Necessary
+
+When rebuilding from fresh Ubuntu VMs, the base OS has no web server installed. The `deploy-task-manager.yml` playbook **assumes NGINX is already present** — it configures virtual hosts (`sites-available/task-manager`), enables them, runs `nginx -t`, and reloads NGINX. It does not install the `nginx` package itself.
+
+Running this playbook first ensures:
+- NGINX package is installed from Ubuntu repositories
+- NGINX service is enabled and running
+- Port 80 is listening and serving a test page (verifies security groups and floating IP work)
+- The `nginx` binary exists for `nginx -t` validation in the next step
+
+Without this step, `deploy-task-manager.yml` would fail at `nginx -t` with "command not found" and the site configuration would have no running service to reload.
+
+### Commands
+
+```bash
+cd ~/git/openstack-zero-to-hero/ansible/03-ubuntu-app-lab
+ansible-playbook -i inventory.yml playbook.yml
+```
+
+**Verify:** Welcome page accessible at `http://<web-01-floating-ip>/` showing "OpenStack + Terraform + Ansible + Hermes".
+
+---
+
+## 11. Step 7 — Ansible: Deploy Flask Application
 
 **Playbook:** `ansible/03-ubuntu-app-lab/deploy-task-manager.yml`
 
@@ -289,7 +326,7 @@ NGINX  /health: {"status": "ok"}
 
 ---
 
-## 11. Step 7 — Verification & Testing
+## 12. Step 8 — Verification & Testing
 
 ### From Hermes (or any LAN host)
 
@@ -349,7 +386,7 @@ sudo -u postgres psql -d appdb -c "SELECT * FROM tasks;"
 
 ---
 
-## 12. Security Precautions Implemented
+## 13. Security Precautions Implemented
 
 | Layer | Protection |
 |-------|------------|
@@ -370,7 +407,7 @@ sudo -u postgres psql -d appdb -c "SELECT * FROM tasks;"
 
 ---
 
-## 13. Lessons Learned
+## 14. Lessons Learned
 
 ### Terraform
 - **Data sources vs resources** — Use `data` for existing infra (networks, images, flavors), `resource` for things Terraform should own
@@ -392,7 +429,7 @@ sudo -u postgres psql -d appdb -c "SELECT * FROM tasks;"
 
 ---
 
-## 14. Relationship to AI Lab & Hermes Workflow
+## 15. Relationship to AI Lab & Hermes Workflow
 
 ### This Lab Extends the AI Lab (02)
 
@@ -435,7 +472,7 @@ Hermes helps translate intent into correct IaC resources — but the human execu
 
 ---
 
-## 15. Repository Files Reference
+## 16. Repository Files Reference
 
 ### Terraform (`terraform/03-ubuntu-app-lab/`)
 ```
@@ -474,7 +511,7 @@ README.md               # Beginner guide (this lab's app documentation)
 
 ---
 
-## 16. Troubleshooting Quick Reference
+## 17. Troubleshooting Quick Reference
 
 | Symptom | Check |
 |---------|-------|
@@ -487,7 +524,7 @@ README.md               # Beginner guide (this lab's app documentation)
 
 ---
 
-## 17. What's Next (Learning Path)
+## 18. What's Next (Learning Path)
 
 1. **Add HTTPS** — certbot + NGINX TLS termination
 2. **Add authentication** — Flask-Login, user sessions
@@ -500,7 +537,7 @@ README.md               # Beginner guide (this lab's app documentation)
 
 ---
 
-## 18. Summary
+## 19. Summary
 
 This lab demonstrated the complete **Infrastructure as Code → Configuration Management → Application Deployment** pipeline:
 
