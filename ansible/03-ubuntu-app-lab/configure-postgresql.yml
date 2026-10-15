@@ -17,7 +17,7 @@
       ansible.builtin.lineinfile:
         path: /etc/postgresql/16/main/postgresql.conf
         regexp: '^#?\s*listen_addresses\s*='
-        line: "listen_addresses = 'localhost,10.20.0.197'"
+        line: "listen_addresses = 'localhost,{{ db_fixed_ip }}'"
         state: present
       register: pg_conf_listen
       notify: restart postgresql
@@ -25,8 +25,8 @@
     - name: Ensure pg_hba.conf allows appuser from web-01 IP to appdb with scram-sha-256
       ansible.builtin.lineinfile:
         path: /etc/postgresql/16/main/pg_hba.conf
-        regexp: '^host\s+appdb\s+appuser\s+10\.20\.0\.15/32\s+'
-        line: 'host    appdb           appuser         10.20.0.15/32               scram-sha-256'
+        regexp: '^host\s+appdb\s+appuser\s+\S+\s+'
+        line: "host    appdb           appuser         {{ web_fixed_ip }}/32               scram-sha-256"
         state: present
       register: pg_hba_app
       notify: restart postgresql
@@ -58,9 +58,9 @@
     - name: Assert listen_addresses is correct
       ansible.builtin.assert:
         that:
-          - "pg_listen_verify.query_result[0].listen_addresses == 'localhost,10.20.0.197'"
+          - "pg_listen_verify.query_result[0].listen_addresses == 'localhost,{{ db_fixed_ip }}'"
         fail_msg: "listen_addresses not set correctly"
-        success_msg: "listen_addresses verified: localhost,10.20.0.197"
+        success_msg: "listen_addresses verified: localhost,{{ db_fixed_ip }}"
       changed_when: false
 
     - name: Assert pg_hba_file_rules has no errors
