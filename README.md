@@ -329,6 +329,32 @@ Documents the successful node2-to-node1 block live migration.
 
 ---
 
+### Chapter 20 — Ubuntu Application Lab — Zero to Hero
+
+[Ubuntu Application Lab — Zero to Hero](docs/20-ubuntu-app-lab-zero-to-hero.md)
+
+This guide walks through building a complete two-tier web application on OpenStack using Terraform, Ansible, PostgreSQL, Flask, Gunicorn, and NGINX.
+
+### Chapter 21 — Ceph Readiness Assessment
+
+[Ceph Readiness Assessment](docs/21-ceph-readiness.md)
+
+Assesses the readiness of the three OpenStack nodes for Ceph deployment.
+
+### Chapter 22 — Ceph Deployment Design
+
+[Ceph Deployment Design](docs/22-ceph-deployment-design.md)
+
+Proposes the design for Ceph deployment on the three OpenStack nodes.
+
+### Chapter 23 — Ceph Preflight Diagnostics
+
+[Ceph Preflight Diagnostics](docs/23-ceph-preflight.md)
+
+Documents diagnostic-tool installation, completed baseline checks, and remaining manual review.
+
+---
+
 ### OpenStack Reboot and Recovery Runbook
 
 ```text

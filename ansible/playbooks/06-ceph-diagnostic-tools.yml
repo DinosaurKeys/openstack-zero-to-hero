@@ -1,0 +1,18 @@
+---
+- name: Ceph diagnostic tools
+  hosts: openstack
+  become: true
+  gather_facts: false
+
+  environment:
+    NEEDRESTART_SUSPEND: "1"
+
+  tasks:
+    - name: smartmontools
+      ansible.builtin.apt:
+        name: smartmontools
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        install_recommends: false
+        policy_rc_d: 101
