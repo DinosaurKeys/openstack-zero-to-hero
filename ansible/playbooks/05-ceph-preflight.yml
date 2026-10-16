@@ -1,0 +1,811 @@
+---
+- name: Ceph preflight checks
+  hosts: openstack
+  become: true
+  vars:
+    ceph_block_devices:
+      - host: node1
+        ansible_host: 192.168.0.200
+        path: "/dev/disk/by-id/ata-KINGSTON_SUV400S37240G_50026B7766070422"
+        serial: "50026B7766070422"
+      - host: node2
+        ansible_host: 192.168.0.201
+        path: "/dev/disk/by-id/ata-ADATA_SU630_4P3521354988"
+        serial: "4P3521354988"
+      - host: node3
+        ansible_host: 192.168.0.202
+        path: "/dev/disk/by-id/ata-KINGSTON_SA400S37240G_50026B768317883A"
+        serial: "50026B768317883A"
+    nvme_device: "/dev/nvme0n1"
+
+  tasks:
+    # ── 1. Device selection and verification ────────────────────────────────
+
+    - name: Find device mappings for this host
+      ansible.builtin.set_fact:
+        ceph_matching_devices: "{{ ceph_block_devices | selectattr('host', 'equalto', inventory_hostname) | list }}"
+
+    - name: Assert exactly one device mapping per host
+      ansible.builtin.assert:
+        that:
+          - ceph_matching_devices | length == 1
+        fail_msg: "Expected exactly one device mapping for {{ inventory_hostname }}, found {{ ceph_matching_devices | length }}"
+
+    - name: Set selected Ceph device
+      ansible.builtin.set_fact:
+        ceph_device: "{{ ceph_matching_devices[0] }}"
+
+    - name: Assert host and IP match design
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname == ceph_device.host
+          - ansible_host == ceph_device.ansible_host
+        fail_msg: "Host/IP mismatch: {{ inventory_hostname }}/{{ ansible_host }} vs {{ ceph_device.host }}/{{ ceph_device.ansible_host }}"
+
+    - name: Verify selected device exists and is a block device
+      ansible.builtin.stat:
+        path: "{{ ceph_device.path }}"
+        follow: true
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      register: ceph_device_stat
+
+    - name: Show device stat result (exists, isblk)
+      ansible.builtin.debug:
+        msg:
+          - "exists: {{ ceph_device_stat.stat.exists }}"
+          - "isblk: {{ ceph_device_stat.stat.isblk }}"
+
+    - name: Assert selected device exists and is a block device
+      ansible.builtin.assert:
+        that:
+          - ceph_device_stat.stat.exists
+          - ceph_device_stat.stat.isblk
+        fail_msg: "Selected device {{ ceph_device.path }} is missing or not a block device"
+
+    - name: Resolve selected device to kernel name (e.g., sda)
+      ansible.builtin.command:
+        argv:
+          - readlink
+          - -f
+          - "{{ ceph_device.path }}"
+      register: ceph_device_resolved
+      changed_when: false
+      failed_when: false
+
+    - name: Show readlink result (rc, stdout, stderr)
+      ansible.builtin.debug:
+        msg:
+          - "readlink rc: {{ ceph_device_resolved.rc }}"
+          - "stdout: {{ ceph_device_resolved.stdout }}"
+          - "stderr: {{ ceph_device_resolved.stderr | trim }}"
+
+    - name: Assert readlink succeeded
+      ansible.builtin.assert:
+        that:
+          - ceph_device_resolved.rc == 0
+        fail_msg: "readlink failed: rc={{ ceph_device_resolved.rc }}, stderr={{ ceph_device_resolved.stderr | trim }}"
+
+    - name: Assert resolved device is not /dev/nvme0n1
+      ansible.builtin.assert:
+        that:
+          - ceph_device_resolved.stdout != nvme_device
+        fail_msg: "Selected device resolves to {{ nvme_device }}; excluded from Ceph OSD selection"
+
+    - name: Set kernel device name fact
+      ansible.builtin.set_fact:
+        ceph_kernel_device: "{{ ceph_device_resolved.stdout | basename }}"
+
+    - name: Verify device serial matches design (parent row only)
+      ansible.builtin.command:
+        argv:
+          - lsblk
+          - -n
+          - -d
+          - -o
+          - SERIAL
+          - "{{ ceph_device.path }}"
+      register: device_serial
+      changed_when: false
+      failed_when: false
+
+    - name: Show serial check result (rc, stdout, stderr)
+      ansible.builtin.debug:
+        msg:
+          - "lsblk serial rc: {{ device_serial.rc }}"
+          - "stdout: {{ device_serial.stdout | trim }}"
+          - "stderr: {{ device_serial.stderr | trim }}"
+
+    - name: Assert serial matches expected value
+      ansible.builtin.assert:
+        that:
+          - device_serial.rc == 0
+          - device_serial.stdout | trim == ceph_device.serial
+        fail_msg: "Serial mismatch: expected {{ ceph_device.serial }}, got {{ device_serial.stdout | trim }}"
+
+    - name: Verify device type is whole disk (parent row only)
+      ansible.builtin.command:
+        argv:
+          - lsblk
+          - -n
+          - -d
+          - -o
+          - TYPE
+          - "{{ ceph_device.path }}"
+      register: device_type
+      changed_when: false
+      failed_when: false
+
+    - name: Show device type check result (rc, stdout, stderr)
+      ansible.builtin.debug:
+        msg:
+          - "lsblk type rc: {{ device_type.rc }}"
+          - "stdout: {{ device_type.stdout | trim }}"
+          - "stderr: {{ device_type.stderr | trim }}"
+
+    - name: Assert device is a whole disk
+      ansible.builtin.assert:
+        that:
+          - device_type.rc == 0
+          - device_type.stdout | trim == "disk"
+        fail_msg: "Device {{ ceph_device.path }} is not a whole disk (type: {{ device_type.stdout | trim }})"
+
+    # ── 2. Descendant enumeration and inspection ────────────────────────────
+
+    - name: Enumerate selected disk and ALL descendants using structured lsblk
+      ansible.builtin.command:
+        argv:
+          - lsblk
+          - --json
+          - --list
+          - --output=PATH,KNAME,TYPE,MOUNTPOINTS
+          - "{{ ceph_device.path }}"
+      register: lsblk_tree_json
+      changed_when: false
+      failed_when: false
+
+    - name: Show lsblk JSON result (rc, stdout, stderr)
+      ansible.builtin.debug:
+        msg:
+          - "lsblk -J rc: {{ lsblk_tree_json.rc }}"
+          - "stdout: {{ lsblk_tree_json.stdout }}"
+          - "stderr: {{ lsblk_tree_json.stderr | trim }}"
+
+    - name: Parse lsblk JSON output into device list
+      ansible.builtin.set_fact:
+        ceph_device_list: "{{ (lsblk_tree_json.stdout | from_json).blockdevices }}"
+
+    - name: Assert lsblk returned valid JSON with nonempty device list containing selected disk
+      ansible.builtin.assert:
+        that:
+          - lsblk_tree_json.rc == 0
+          - ceph_device_list | length > 0
+          - (ceph_device_resolved.stdout | trim) in (ceph_device_list | map(attribute='path') | list)
+        fail_msg: "lsblk failed: rc={{ lsblk_tree_json.rc }}, stderr={{ lsblk_tree_json.stderr | trim }}, or selected device not in listing"
+
+    - name: Show enumerated descendant devices (path, kname, type)
+      ansible.builtin.debug:
+        msg: "Device tree: {{ ceph_device_list | map(attribute='path') | list }}"
+
+    - name: Show blkid export for selected device
+      ansible.builtin.command:
+        argv:
+          - blkid
+          - -p
+          - -o
+          - export
+          - "{{ ceph_device.path }}"
+      register: blkid_output
+      changed_when: false
+      failed_when: false
+
+    - name: Report blkid result (rc, stdout, stderr)
+      ansible.builtin.debug:
+        msg:
+          - "blkid rc: {{ blkid_output.rc }}"
+          - "stdout: {{ blkid_output.stdout | trim }}"
+          - "stderr: {{ blkid_output.stderr | trim }}"
+          - "msg: {{ blkid_output.msg | default('') }}"
+
+    - name: Assert blkid check completed (tool available, no unexpected errors)
+      ansible.builtin.assert:
+        that:
+          - blkid_output.rc == 0 or blkid_output.rc == 2
+          - (blkid_output.stderr | default('') | trim | length) == 0
+          - (blkid_output.msg | default('') | trim | length) == 0
+        fail_msg: "blkid check failed: rc={{ blkid_output.rc }}, stderr={{ blkid_output.stderr | trim }}, msg={{ blkid_output.msg | default('') | trim }}"
+
+    - name: Handle blkid no-signature result for review
+      ansible.builtin.debug:
+        msg: "blkid no signature reported (rc=2): review required — old metadata may be present but not visible to blkid"
+      when: blkid_output.rc == 2
+
+    - name: Show all mounts
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - --bytes
+          - --output=TARGET,SOURCE,FSTYPE,OPTIONS
+      register: all_mounts
+      changed_when: false
+      failed_when: false
+
+    - name: Report all-mounts findmnt result
+      ansible.builtin.debug:
+        msg:
+          - "findmnt (all) rc: {{ all_mounts.rc }}"
+          - "stdout: {{ all_mounts.stdout }}"
+          - "stderr: {{ all_mounts.stderr | trim }}"
+
+    - name: Show mounts for selected device and each descendant
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - --source
+          - "{{ item.path }}"
+      loop: "{{ ceph_device_list }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: device_mounts
+      changed_when: false
+      failed_when: false
+
+    - name: Report mount inspection results per device
+      ansible.builtin.debug:
+        msg: "findmnt for {{ item.item.path }} — rc={{ item.rc }}, stdout={{ item.stdout | trim }}, stderr={{ item.stderr | trim }}"
+      loop: "{{ device_mounts.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+
+    - name: Assert no selected device or descendant is mounted or has inspection errors
+      ansible.builtin.assert:
+        that:
+          - item.rc == 1
+          - (item.stdout | default('') | trim | length) == 0
+          - (item.stderr | default('') | trim | length) == 0
+        fail_msg: |
+          Mount inspection unexpected result for {{ item.item.path }}:
+          rc={{ item.rc }}, stdout='{{ item.stdout | trim }}', stderr='{{ item.stderr | trim }}'
+      loop: "{{ device_mounts.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+
+    - name: Inspect processes using the selected disk and each descendant (no signals)
+      ansible.builtin.command:
+        argv: [fuser, "{{ item.path }}"]
+      loop: "{{ ceph_device_list }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: disk_user_results
+      changed_when: false
+      failed_when: false
+
+    - name: Report fuser results per device
+      ansible.builtin.debug:
+        msg: "fuser for {{ item.item.path }} — rc={{ item.rc }}, stdout={{ item.stdout | trim }}, stderr={{ item.stderr | trim }}"
+      loop: "{{ disk_user_results.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+
+    - name: Assert no processes on any enumerated device
+      ansible.builtin.assert:
+        that:
+          - not (item.rc == 127 or 'not found' in item.stderr | lower)
+          - item.rc == 1
+          - (item.stdout | default('') | trim | length) == 0
+          - (item.stderr | default('') | trim | length) == 0
+        fail_msg: |
+          Disk users or inspection error on {{ item.item.path }}:
+          rc={{ item.rc }},
+          stdout='{{ item.stdout | trim }}',
+          stderr='{{ item.stderr | trim }}'
+      loop: "{{ disk_user_results.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+
+    - name: Inspect sysfs holders for each enumerated device
+      ansible.builtin.command:
+        argv:
+          - ls
+          - -1
+          - /sys/class/block/{{ item.kname }}/holders/
+      loop: "{{ ceph_device_list }}"
+      loop_control:
+        label: "{{ item.kname }}"
+      register: holder_results
+      changed_when: false
+      failed_when: false
+
+    - name: Report holder inspection results per device
+      ansible.builtin.debug:
+        msg: "holders /sys/class/block/{{ item.item.kname }}/holders/ — rc={{ item.rc }}, stdout={{ item.stdout | trim }}, stderr={{ item.stderr | trim }}"
+      loop: "{{ holder_results.results }}"
+      loop_control:
+        label: "{{ item.item.kname }}"
+
+    - name: Assert holder inspection succeeded for every device
+      ansible.builtin.assert:
+        that:
+          - item.rc == 0
+          - (item.stderr | default('') | trim | length) == 0
+        fail_msg: |
+          Holder inspection failed for {{ item.item.kname }}:
+          rc={{ item.rc }}, stderr='{{ item.stderr | trim }}'
+      loop: "{{ holder_results.results }}"
+      loop_control:
+        label: "{{ item.item.kname }}"
+
+    - name: Report existing holders for preservation
+      ansible.builtin.debug:
+        msg: "Holder inspection of {{ ceph_device_list | map(attribute='kname') | list }} — review and preserve existing holders before any cleanup"
+
+    - name: Show LVM physical volumes (all)
+      ansible.builtin.command:
+        argv:
+          - pvs
+          - --all
+          - --units=g
+          - --nosuffix
+          - -o
+          - pv_name,vg_name,pv_size,pv_free,pv_attr
+      register: lvm_pvs
+      changed_when: false
+      failed_when: false
+
+    - name: Show LVM volume groups (all)
+      ansible.builtin.command:
+        argv:
+          - vgs
+          - --all
+          - --units=g
+          - --nosuffix
+          - -o
+          - vg_name,vg_size,vg_free,vg_attr
+      register: lvm_vgs
+      changed_when: false
+      failed_when: false
+
+    - name: Show LVM logical volumes (all)
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - --all
+          - --units=g
+          - --nosuffix
+          - -o
+          - lv_name,vg_name,lv_size,lv_attr,lv_path
+      register: lvm_lvs
+      changed_when: false
+      failed_when: false
+
+    - name: Report LVM inspection results
+      ansible.builtin.debug:
+        msg:
+          - "pvs — rc={{ lvm_pvs.rc }}, stdout={{ lvm_pvs.stdout | trim }}"
+          - "vgs — rc={{ lvm_vgs.rc }}, stdout={{ lvm_vgs.stdout | trim }}"
+          - "lvs — rc={{ lvm_lvs.rc }}, stdout={{ lvm_lvs.stdout | trim }}"
+
+    - name: Assert LVM inspection succeeded
+      ansible.builtin.assert:
+        that:
+          - lvm_pvs.rc == 0
+          - lvm_vgs.rc == 0
+          - lvm_lvs.rc == 0
+        fail_msg: "LVM inspection failed: pvs rc={{ lvm_pvs.rc }}, vgs rc={{ lvm_vgs.rc }}, lvs rc={{ lvm_lvs.rc }}"
+
+    - name: Show udevadm info for selected device
+      ansible.builtin.command:
+        argv:
+          - udevadm
+          - info
+          - --query=all
+          - --name={{ ceph_device.path }}
+      register: udevadm_output
+      changed_when: false
+      failed_when: false
+
+    - name: Report udevadm result (rc, stdout, stderr)
+      ansible.builtin.debug:
+        msg:
+          - "udevadm rc: {{ udevadm_output.rc }}"
+          - "stdout: {{ udevadm_output.stdout_lines | default([]) }}"
+          - "stderr: {{ udevadm_output.stderr | trim }}"
+
+    - name: Assert udevadm inspection succeeded
+      ansible.builtin.assert:
+        that:
+          - udevadm_output.rc == 0
+        fail_msg: "udevadm inspection failed: rc={{ udevadm_output.rc }}, stderr={{ udevadm_output.stderr | trim }}"
+
+    # ── 3. TCP port inspection ───────────────────────────────────────────────
+
+    - name: Check Ceph TCP ports (MON v1/v2 and OSD daemon range)
+      ansible.builtin.command:
+        argv:
+          - ss
+          - -H
+          - -ltn
+          - "( sport = :3300 or sport = :6789 or ( sport >= :6800 and sport <= :7568 ) )"
+      register: ceph_tcp_listeners
+      changed_when: false
+      failed_when: false
+
+    - name: Show Ceph TCP listener results (rc, stdout, stderr)
+      ansible.builtin.debug:
+        msg:
+          - "ss Ceph ports — rc={{ ceph_tcp_listeners.rc }}"
+          - "stdout: {{ ceph_tcp_listeners.stdout | trim }}"
+          - "stderr: {{ ceph_tcp_listeners.stderr | trim }}"
+
+    - name: Assert no Ceph ports are occupied
+      ansible.builtin.assert:
+        that:
+          - ceph_tcp_listeners.rc == 0
+          - ceph_tcp_listeners.stderr | trim | length == 0
+          - ceph_tcp_listeners.stdout | trim | length == 0
+        fail_msg: "Ceph TCP ports occupied: stdout={{ ceph_tcp_listeners.stdout | trim }}, stderr={{ ceph_tcp_listeners.stderr | trim }}"
+
+    - name: Show all TCP listeners (headerless) for context
+      ansible.builtin.command:
+        argv:
+          - ss
+          - -H
+          - -ltn
+      register: all_tcp_listeners
+      changed_when: false
+      failed_when: false
+
+    - name: Report all TCP listeners result
+      ansible.builtin.debug:
+        msg:
+          - "ss all — rc={{ all_tcp_listeners.rc }}"
+          - "stdout: {{ all_tcp_listeners.stdout | trim }}"
+          - "stderr: {{ all_tcp_listeners.stderr | trim }}"
+
+    # ── 4. Systemd and Docker checks ────────────────────────────────────────
+
+    - name: Show systemd Ceph units (all states)
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - list-units
+          - --all
+          - --no-legend
+          - 'ceph*'
+      register: systemd_ceph_units
+      changed_when: false
+      failed_when: false
+
+    - name: Report systemd Ceph unit inspection results (rc, stdout, stderr)
+      ansible.builtin.debug:
+        msg:
+          - "systemctl rc: {{ systemd_ceph_units.rc }}"
+          - "stdout: {{ systemd_ceph_units.stdout }}"
+          - "stderr: {{ systemd_ceph_units.stderr | trim }}"
+
+    - name: Assert systemctl inspection succeeded
+      ansible.builtin.assert:
+        that:
+          - systemd_ceph_units.rc == 0
+        fail_msg: "systemctl inspection failed: rc={{ systemd_ceph_units.rc }}, stderr={{ systemd_ceph_units.stderr | trim }}"
+
+    - name: Flag existing Ceph systemd units for review
+      ansible.builtin.assert:
+        that:
+          - systemd_ceph_units.stdout | trim | length == 0
+        fail_msg: "Existing Ceph systemd units found:\n{{ systemd_ceph_units.stdout }}"
+
+    - name: Check Docker installation (version)
+      ansible.builtin.command:
+        argv:
+          - docker
+          - version
+      register: docker_version
+      changed_when: false
+      failed_when: false
+
+    - name: Show Docker version result (rc, stdout, stderr)
+      ansible.builtin.debug:
+        msg:
+          - "docker version rc: {{ docker_version.rc }}"
+          - "stdout: {{ docker_version.stdout | trim }}"
+          - "stderr: {{ docker_version.stderr | trim }}"
+
+    - name: Assert Docker is available and working
+      ansible.builtin.assert:
+        that:
+          - docker_version.rc == 0
+          - docker_version.stdout | trim | length > 0
+        fail_msg: "Docker not available: rc={{ docker_version.rc }}, stderr={{ docker_version.stderr | trim }}"
+
+    - name: Show all Docker containers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+          - -a
+      register: docker_containers
+      changed_when: false
+      failed_when: false
+
+    - name: Show Ceph-related Docker containers (quiet, names only)
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+          - -a
+          - --filter
+          - name=ceph
+          - --quiet
+      register: docker_ceph_containers
+      changed_when: false
+      failed_when: false
+
+    - name: Report Docker container inspection results
+      ansible.builtin.debug:
+        msg:
+          - "docker ps -a — rc={{ docker_containers.rc }}, stdout={{ docker_containers.stdout | trim }}, stderr={{ docker_containers.stderr | trim }}"
+          - "docker ceph containers — rc={{ docker_ceph_containers.rc }}, stdout={{ docker_ceph_containers.stdout | trim }}, stderr={{ docker_ceph_containers.stderr | trim }}"
+
+    - name: Assert both Docker container-listing commands succeeded
+      ansible.builtin.assert:
+        that:
+          - docker_containers.rc == 0
+          - docker_ceph_containers.rc == 0
+        fail_msg: "Docker container listing failed: docker_containers rc={{ docker_containers.rc }} stderr={{ docker_containers.stderr | trim }}, docker_ceph_containers rc={{ docker_ceph_containers.rc }} stderr={{ docker_ceph_containers.stderr | trim }}"
+
+    - name: Flag existing Ceph containers for review
+      ansible.builtin.assert:
+        that:
+          - (docker_ceph_containers.stdout | default('') | trim | length) == 0
+        fail_msg: "Existing Ceph Docker containers found:\n{{ docker_ceph_containers.stdout }}"
+
+    # ── 5. Time synchronization ───────────────────────────────────────────────
+
+    - name: Check time synchronization status
+      ansible.builtin.command:
+        argv:
+          - timedatectl
+          - show
+          - --property=NTPSynchronized
+          - --value
+      register: timedatectl_output
+      changed_when: false
+      failed_when: false
+
+    - name: Show time sync result (rc, stdout, stderr)
+      ansible.builtin.debug:
+        msg:
+          - "timedatectl rc: {{ timedatectl_output.rc }}"
+          - "stdout: {{ timedatectl_output.stdout | trim }}"
+          - "stderr: {{ timedatectl_output.stderr | trim }}"
+
+    - name: Assert time is synchronized
+      ansible.builtin.assert:
+        that:
+          - timedatectl_output.rc == 0
+          - timedatectl_output.stdout | trim == "yes"
+        fail_msg: "Time not synchronized: rc={{ timedatectl_output.rc }}, stdout={{ timedatectl_output.stdout | trim }}, stderr={{ timedatectl_output.stderr | trim }}"
+
+    - name: Show chrony sources if available
+      ansible.builtin.command:
+        argv:
+          - chronyc
+          - sources
+          - -v
+      register: chrony_sources
+      changed_when: false
+      failed_when: false
+
+    - name: Report chrony availability
+      ansible.builtin.debug:
+        msg: "chronyc available: {{ chrony_sources.stdout }}"
+      when: chrony_sources.rc == 0
+
+    - name: Report chrony unavailability with error details
+      ansible.builtin.debug:
+        msg: "chronyc unavailable (rc={{ chrony_sources.rc }}): {{ chrony_sources.stderr | trim }}"
+      when: chrony_sources.rc != 0
+
+    # ── 6. Memory and swap ──────────────────────────────────────────────────
+
+    - name: Show memory in MiB
+      ansible.builtin.command:
+        argv:
+          - free
+          - -m
+      register: memory_mib
+      changed_when: false
+      failed_when: false
+
+    - name: Report memory result (rc, stdout, stderr)
+      ansible.builtin.debug:
+        msg:
+          - "free -m rc: {{ memory_mib.rc }}"
+          - "stdout: {{ memory_mib.stdout | trim }}"
+          - "stderr: {{ memory_mib.stderr | trim }}"
+
+    - name: Show /proc/meminfo
+      ansible.builtin.command:
+        argv:
+          - cat
+          - /proc/meminfo
+      register: meminfo_output
+      changed_when: false
+      failed_when: false
+
+    - name: Report meminfo result (rc, stdout, stderr)
+      ansible.builtin.debug:
+        msg:
+          - "meminfo rc: {{ meminfo_output.rc }}"
+          - "stdout: {{ meminfo_output.stdout | trim }}"
+          - "stderr: {{ meminfo_output.stderr | trim }}"
+
+    - name: Show swap configuration
+      ansible.builtin.command:
+        argv:
+          - swapon
+          - --show
+      register: swap_show
+      changed_when: false
+      failed_when: false
+
+    - name: Report swap configuration result (rc, stdout, stderr)
+      ansible.builtin.debug:
+        msg:
+          - "swapon rc: {{ swap_show.rc }}"
+          - "stdout: {{ swap_show.stdout | trim }}"
+          - "stderr: {{ swap_show.stderr | trim }}"
+
+    - name: Show swap activity using vmstat 1 3
+      ansible.builtin.command:
+        argv:
+          - vmstat
+          - "1"
+          - "3"
+      register: vmstat_swap
+      changed_when: false
+      failed_when: false
+
+    - name: Report vmstat result (rc, stdout, stderr)
+      ansible.builtin.debug:
+        msg:
+          - "vmstat rc: {{ vmstat_swap.rc }}"
+          - "stdout: {{ vmstat_swap.stdout | trim }}"
+          - "stderr: {{ vmstat_swap.stderr | trim }}"
+
+    - name: Show Python version
+      ansible.builtin.command:
+        argv:
+          - python3
+          - --version
+      register: python_version
+      changed_when: false
+      failed_when: false
+
+    - name: Report Python version result (rc, stdout, stderr)
+      ansible.builtin.debug:
+        msg:
+          - "python3 rc: {{ python_version.rc }}"
+          - "stdout: {{ python_version.stdout | trim }}"
+          - "stderr: {{ python_version.stderr | trim }}"
+
+    # ── 7. Network ───────────────────────────────────────────────────────────
+
+    - name: Show network interfaces and addresses
+      ansible.builtin.command:
+        argv:
+          - ip
+          - -br
+          - addr
+      register: network_interfaces
+      changed_when: false
+      failed_when: false
+
+    - name: Report network interfaces result
+      ansible.builtin.debug:
+        msg:
+          - "ip addr rc: {{ network_interfaces.rc }}"
+          - "stdout: {{ network_interfaces.stdout }}"
+          - "stderr: {{ network_interfaces.stderr | trim }}"
+
+    - name: Show routing table
+      ansible.builtin.command:
+        argv:
+          - ip
+          - route
+      register: routing_table
+      changed_when: false
+      failed_when: false
+
+    - name: Report routing table result
+      ansible.builtin.debug:
+        msg:
+          - "ip route rc: {{ routing_table.rc }}"
+          - "stdout: {{ routing_table.stdout }}"
+          - "stderr: {{ routing_table.stderr | trim }}"
+
+    - name: Show firewall rules (ufw)
+      ansible.builtin.command:
+        argv:
+          - ufw
+          - status
+          - verbose
+      register: ufw_status
+      changed_when: false
+      failed_when: false
+
+    - name: Report ufw availability with error details
+      ansible.builtin.debug:
+        msg: "ufw available (rc=0): {{ ufw_status.stdout }}"
+      when: ufw_status.rc == 0
+
+    - name: Report ufw unavailability with error details
+      ansible.builtin.debug:
+        msg: "ufw not available (rc={{ ufw_status.rc }}): {{ ufw_status.stderr | trim }}"
+      when: ufw_status.rc != 0
+
+    - name: Show firewall rules (firewalld)
+      ansible.builtin.command:
+        argv:
+          - firewall-cmd
+          - --list-all
+      register: firewalld_status
+      changed_when: false
+      failed_when: false
+
+    - name: Report firewalld availability with error details
+      ansible.builtin.debug:
+        msg: "firewalld available (rc=0): {{ firewalld_status.stdout }}"
+      when: firewalld_status.rc == 0
+
+    - name: Report firewalld unavailability with error details
+      ansible.builtin.debug:
+        msg: "firewalld not available (rc={{ firewalld_status.rc }}): {{ firewalld_status.stderr | trim }}"
+      when: firewalld_status.rc != 0
+
+    # ── 8. SMART health ──────────────────────────────────────────────────────
+
+    - name: Show SMART health for selected disk (JSON)
+      ansible.builtin.command:
+        argv:
+          - smartctl
+          - -a
+          - -j
+          - "{{ ceph_device.path }}"
+      register: smartctl_output
+      changed_when: false
+      failed_when: false
+
+    - name: Display SMART result (rc, stdout, stderr)
+      ansible.builtin.debug:
+        msg:
+          - "smartctl rc: {{ smartctl_output.rc }}"
+          - "stdout: {{ smartctl_output.stdout }}"
+          - "stderr: {{ smartctl_output.stderr | trim }}"
+
+    - name: Assert SMART health check completed successfully
+      ansible.builtin.assert:
+        that:
+          - smartctl_output.rc == 0
+        fail_msg: "SMART check failed: rc={{ smartctl_output.rc }}, stderr={{ smartctl_output.stderr | trim }}"
+
+    - name: Parse SMART JSON output
+      ansible.builtin.set_fact:
+        smart_status: "{{ smartctl_output.stdout | from_json }}"
+
+    - name: Assert SMART health passed
+      ansible.builtin.assert:
+        that:
+          - smart_status.smart_status is defined
+          - smart_status.smart_status.passed == true
+        fail_msg: "SMART health check not passed: {{ smart_status.smart_status | default('not reported') }}"
+
+    # ── 9. Boundary ──────────────────────────────────────────────────────────
+
+    - name: Explain the boundary of this baseline report
+      ansible.builtin.debug:
+        msg:
+          - "Baseline checks completed; old Ceph LVM/BlueStore metadata is preserved."
+          - "This report does not authorize installation, disk cleanup, or OpenStack changes."
