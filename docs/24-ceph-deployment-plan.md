@@ -58,6 +58,16 @@ one. Record the actual artifact hash and resolved image digest during approved
 installation; a locally calculated hash is an inventory record, not independent
 proof of authenticity. Any version change requires review.
 
+## cephadm vs MGR
+
+The standalone cephadm executable is our deployment and administration tool,
+initially installed on node2. MGR is a continuously running Ceph management
+service; our design places MGR containers on node2 and node3: one active, one
+standby. The active MGR runs the cephadm orchestration module, coordinating
+daemon deployment across hosts through SSH. Node3 can run MGR without a
+separately installed host cephadm executable. Playbook 07 installs the
+executable only; bootstrap later creates the first MON and MGR.
+
 ## Stage 0 — Readiness and Approval Before Installation
 
 Before requesting approval to run the installation/bootstrap automation:
