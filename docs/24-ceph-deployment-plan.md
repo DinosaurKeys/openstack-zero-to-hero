@@ -1,7 +1,8 @@
 # Ceph Deployment Plan
 
-Status: DRAFT — installation, bootstrap, SSH authorization changes, disk cleanup,
-and OSD creation are not approved for execution.
+Status: DRAFT — standalone cephadm installation on node2 is complete.
+Cluster bootstrap, host enrollment, SSH authorization changes, disk cleanup,
+and OSD creation remain unapproved.
 
 ## Purpose and Scope
 
@@ -107,6 +108,8 @@ After approved installation, verify on node2:
 /usr/local/sbin/cephadm-20.2.4 version
 ```
 
+Status: node2 executable installed; see [chapter 25](25-cephadm-installation.md).
+Bootstrap, host enrollment, disk cleanup, and OSD creation remain unapproved.
 Require release **20.2.4**, not “20.2.4 or later”. Stop on a download error,
 unexpected existing file, execution error, or version mismatch.
 
