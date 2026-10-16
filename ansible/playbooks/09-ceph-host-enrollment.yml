@@ -1,0 +1,498 @@
+---
+# node2 coordinates; delegated checks and key updates touch node1 and node3.
+# This is a fresh-enrollment stage. Inspect partial state before any retry.
+- name: Enroll node1 and node3 and place Ceph MON and MGR services
+  hosts: node2
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    cephadm_bin: /usr/local/sbin/cephadm-20.2.4
+    ceph_image: quay.io/ceph/ceph:v20.2.4
+    ceph_ssh_user: openstack
+    ceph_management_interface: br-mgmt
+    ceph_targets:
+      - name: node1
+        ip: 192.168.0.200
+      - name: node3
+        ip: 192.168.0.202
+    ceph_cli_argv:
+      - "{{ cephadm_bin }}"
+      - --docker
+      - --image
+      - "{{ ceph_image }}"
+      - shell
+      - --fsid
+      - "{{ ceph_expected_fsid }}"
+      - --
+      - ceph
+    # cephadm may adjust active firewalld rules during daemon deployment.
+    # This stage must stop for review instead of changing host firewall policy.
+    ceph_firewall_preflight_python: |
+      import shutil
+      import subprocess
+      import sys
+      if shutil.which("firewall-cmd") is None:
+          print("firewalld command is absent")
+      else:
+          result = subprocess.run(
+              ["systemctl", "is-active", "firewalld.service"],
+              capture_output=True, text=True, check=False, timeout=30,
+          )
+          if result.returncode == 0:
+              sys.exit("Active firewalld requires review before Ceph daemon deployment; no rules were changed.")
+          if result.returncode not in (3, 4) or result.stdout.strip() not in ("inactive", "failed", "unknown"):
+              sys.exit(f"Cannot inspect firewalld: {result.stdout} {result.stderr}")
+          print(f"firewalld is not active ({result.stdout.strip()})")
+    # Every subprocess here is a read-only query; no shell is invoked.
+    ceph_host_preflight_python: |
+      import json
+      import os
+      import pwd
+      import shutil
+      import stat
+      import subprocess
+      import sys
+
+      expected_name, expected_ip, interface, ssh_user = sys.argv[1:]
+
+      def run(argv):
+          result = subprocess.run(
+              argv, capture_output=True, text=True, check=False, timeout=30,
+          )
+          if result.returncode != 0:
+              raise RuntimeError(
+                  f"{argv!r}: rc={result.returncode}; "
+                  f"stdout={result.stdout.strip()}; stderr={result.stderr.strip()}"
+              )
+          return result
+
+      try:
+          if os.geteuid() != 0:
+              raise RuntimeError("Preflight must run through passwordless sudo")
+          for program in ["python3", "systemctl", "docker", "lvcreate", "ip",
+                          "ss", "ssh", "ssh-keygen"]:
+              if shutil.which(program) is None:
+                  raise RuntimeError(f"Missing dependency: {program}")
+
+          actual_name = run(["hostname"]).stdout.strip()
+          if actual_name != expected_name:
+              raise RuntimeError(f"Wrong host: expected {expected_name}, got {actual_name}")
+          run(["systemctl", "is-active", "docker"])
+          run(["docker", "version"])
+          if run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"]).stdout.strip() != "yes":
+              raise RuntimeError("System clock is not synchronized")
+
+          # Match Ceph 20.2.4's time-service search order, without enabling units.
+          time_units = [
+              "chrony.service", "chronyd.service", "systemd-timesyncd.service",
+              "ntpd.service", "ntp.service", "ntpsec.service",
+              "openntpd.service", "timemaster.service",
+          ]
+          for unit in time_units:
+              enabled = subprocess.run(
+                  ["systemctl", "is-enabled", unit], capture_output=True,
+                  text=True, check=False, timeout=30,
+              )
+              active = subprocess.run(
+                  ["systemctl", "is-active", unit], capture_output=True,
+                  text=True, check=False, timeout=30,
+              )
+              if enabled.returncode == 0 and active.stdout.strip() == "active":
+                  time_service = unit
+                  break
+              if enabled.returncode == 0 or "disabled" in enabled.stdout:
+                  raise RuntimeError(f"Review {unit}: Ceph may try to enable/start it")
+          else:
+              raise RuntimeError("No enabled, active time service recognized by Ceph")
+
+          addresses = json.loads(run(["ip", "-j", "-4", "address", "show"]).stdout)
+          matching_addresses = [
+              address
+              for device in addresses if device.get("ifname") == interface
+              for address in device.get("addr_info", [])
+              if address.get("local") == expected_ip and address.get("prefixlen") == 24
+          ]
+          if len(matching_addresses) != 1:
+              raise RuntimeError(f"Expected {expected_ip}/24 on {interface}")
+
+          for path in ["/etc/ceph", "/var/lib/ceph"]:
+              if os.path.lexists(path):
+                  raise RuntimeError(f"Existing Ceph path requires review: {path}")
+          containers = run(["docker", "ps", "--all", "--no-trunc"])
+          if "ceph" in containers.stdout.lower():
+              raise RuntimeError("A container name or image contains ceph")
+          # Unfiltered listing avoids systemctl's no-match return code.
+          units = run(["systemctl", "list-unit-files", "--no-legend", "--no-pager"])
+          if any(line.split()[0].lower().startswith("ceph")
+                 for line in units.stdout.splitlines() if line.strip()):
+              raise RuntimeError("Existing Ceph systemd unit files require review")
+          listeners = run([
+              "ss", "-H", "-lntp",
+              "( sport = :3300 or sport = :6789 or ( sport >= :6800 and sport <= :7568 ) )",
+          ])
+          if listeners.stdout.strip() or listeners.stderr.strip():
+              raise RuntimeError(
+                  f"Ceph port conflict or inspection warning: "
+                  f"{listeners.stdout.strip()} {listeners.stderr.strip()}"
+              )
+
+          account = pwd.getpwnam(ssh_user)
+          home = account.pw_dir
+          home_stat = os.lstat(home)
+          if not stat.S_ISDIR(home_stat.st_mode) or home_stat.st_uid != account.pw_uid:
+              raise RuntimeError("SSH account home must be a directory owned by that account")
+          ssh_dir = os.path.join(home, ".ssh")
+          authorized_keys = os.path.join(ssh_dir, "authorized_keys")
+          for path, directory in [(ssh_dir, True), (authorized_keys, False)]:
+              if os.path.lexists(path):
+                  attributes = os.lstat(path)
+                  valid_type = stat.S_ISDIR(attributes.st_mode) if directory else stat.S_ISREG(attributes.st_mode)
+                  if not valid_type or attributes.st_uid != account.pw_uid:
+                      raise RuntimeError(f"Review SSH path type/ownership: {path}")
+
+          memory = {}
+          with open("/proc/meminfo", encoding="utf-8") as stream:
+              for line in stream:
+                  key, value = line.split(":", 1)
+                  memory[key] = int(value.split()[0])
+          print(json.dumps({
+              "hostname": actual_name, "management_ip": expected_ip,
+              "time_service": time_service, "uid": account.pw_uid,
+              "gid": account.pw_gid, "ssh_dir": ssh_dir,
+              "authorized_keys": authorized_keys,
+              "available_mib": memory["MemAvailable"] // 1024,
+              "swap_used_mib": (memory["SwapTotal"] - memory["SwapFree"]) // 1024,
+              "root_free_gib": round(shutil.disk_usage("/").free / 1024**3, 2),
+          }))
+      except (OSError, KeyError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+          sys.exit(f"Preflight failed for {expected_name}: {error}")
+
+  pre_tasks:
+    - name: Require host enrollment approval before any infrastructure change
+      ansible.builtin.assert:
+        that:
+          - ceph_host_enrollment_approved | default(false) | bool
+        fail_msg: "ceph_host_enrollment_approved must be true"
+
+    - name: Require the expected cluster FSID from the bootstrap record
+      ansible.builtin.assert:
+        that:
+          - ceph_expected_fsid is defined
+          - ceph_expected_fsid is string
+          - ceph_expected_fsid | length == 36
+        fail_msg: "Supply ceph_expected_fsid for the cluster being expanded."
+
+    - name: Assert coordinator inventory identity
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname == 'node2'
+          - ansible_host == '192.168.0.201'
+
+    - name: Assert delegated targets use the intended inventory addresses
+      ansible.builtin.assert:
+        that:
+          - item.name in hostvars
+          - hostvars[item.name].ansible_host == item.ip
+      loop: "{{ ceph_targets }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+  tasks:
+    - name: Verify installed cephadm version
+      ansible.builtin.command:
+        argv: ["{{ cephadm_bin }}", version]
+      register: version_check
+      changed_when: false
+      failed_when: version_check.rc != 0 or version_check.stdout.split()[:3] != ['cephadm', 'version', '20.2.4']
+
+    - name: Verify actual coordinator hostname
+      ansible.builtin.command:
+        argv: [hostname]
+      register: coordinator_hostname
+      changed_when: false
+      failed_when: coordinator_hostname.rc != 0 or coordinator_hostname.stdout | trim != 'node2'
+
+    - name: Read current cluster status without changing it
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['status', '--format', 'json'] }}"
+      register: initial_status
+      changed_when: false
+
+    - name: Verify this is the intended cluster with no unexpected health checks
+      ansible.builtin.assert:
+        that:
+          - (initial_status.stdout | from_json).fsid == ceph_expected_fsid
+          - (initial_status.stdout | from_json).health.status != 'HEALTH_ERR'
+          - >-
+            ((initial_status.stdout | from_json).health.checks.keys()
+            | list | difference(['TOO_FEW_OSDS']) | length) == 0
+        fail_msg: "Cluster identity or health requires review before enrollment."
+
+    - name: Read current host inventory
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['orch', 'host', 'ls', '--format', 'json'] }}"
+      register: initial_hosts
+      changed_when: false
+
+    - name: Require the fresh node2-only enrollment baseline
+      ansible.builtin.assert:
+        that:
+          - (initial_hosts.stdout | from_json | length) == 1
+          - (initial_hosts.stdout | from_json)[0].hostname == 'node2'
+          - (initial_hosts.stdout | from_json)[0].addr == '192.168.0.201'
+          - (initial_hosts.stdout | from_json)[0].status == ''
+          - "'_admin' in (initial_hosts.stdout | from_json)[0].labels"
+        fail_msg: "Enrollment may already be partially applied; inspect current state before retrying."
+
+    - name: Inspect existing service specifications
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['orch', 'ls', '--format', 'json'] }}"
+      register: initial_services
+      changed_when: false
+
+    - name: Reject unrelated service specifications including automatic OSD provisioning
+      ansible.builtin.assert:
+        that:
+          - >-
+            ((initial_services.stdout | from_json | map(attribute='service_type')
+            | list) | difference(['mon', 'mgr', 'crash']) | length) == 0
+        fail_msg: "Unexpected Ceph service specifications require review before adding hosts."
+
+    - name: Read only the cluster public SSH key
+      ansible.builtin.slurp:
+        src: /etc/ceph/ceph.pub
+      register: ceph_pub
+      no_log: true
+
+    - name: Prepare the single public key line
+      ansible.builtin.set_fact:
+        ceph_pub_line: "{{ ceph_pub.content | b64decode | trim }}"
+      no_log: true
+
+    - name: Require a single SSH public key
+      ansible.builtin.assert:
+        that:
+          - ceph_pub_line.splitlines() | length == 1
+          - ceph_pub_line.split() | length >= 2
+          - >-
+            ceph_pub_line.split()[0] in ['ssh-rsa', 'ssh-ed25519',
+            'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521']
+        fail_msg: "Ceph's public-key file is not a single supported SSH public key."
+
+    - name: Validate and fingerprint the public key without generating keys
+      ansible.builtin.command:
+        argv: [ssh-keygen, -l, -f, /etc/ceph/ceph.pub]
+      register: public_key_fingerprint
+      changed_when: false
+
+    - name: Verify daemon deployment will not modify an active firewalld configuration
+      ansible.builtin.command:
+        argv: [python3, -c, "{{ ceph_firewall_preflight_python }}"]
+      delegate_to: "{{ item }}"
+      loop: "{{ ['node2'] + (ceph_targets | map(attribute='name') | list) }}"
+      register: firewall_readiness
+      changed_when: false
+
+    - name: Complete read-only checks on both new hosts before authorizing the key
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - "{{ ceph_host_preflight_python }}"
+          - "{{ item.name }}"
+          - "{{ item.ip }}"
+          - "{{ ceph_management_interface }}"
+          - "{{ ceph_ssh_user }}"
+      delegate_to: "{{ item.name }}"
+      loop: "{{ ceph_targets }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: new_host_readiness
+      changed_when: false
+
+    - name: Report new-host readiness including memory and free space
+      ansible.builtin.debug:
+        msg: "{{ item.stdout | from_json }}"
+      loop: "{{ new_host_readiness.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Ensure the SSH directories have the account's ownership and private permissions
+      ansible.builtin.file:
+        path: "{{ (item.stdout | from_json).ssh_dir }}"
+        state: directory
+        owner: "{{ ceph_ssh_user }}"
+        group: "{{ (item.stdout | from_json).gid | string }}"
+        mode: '0700'
+      delegate_to: "{{ item.item.name }}"
+      loop: "{{ new_host_readiness.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Append the public key while preserving all existing authorized keys
+      ansible.builtin.lineinfile:
+        path: "{{ (item.stdout | from_json).authorized_keys }}"
+        line: "{{ ceph_pub_line }}"
+        state: present
+        create: true
+        owner: "{{ ceph_ssh_user }}"
+        group: "{{ (item.stdout | from_json).gid | string }}"
+        mode: '0600'
+      delegate_to: "{{ item.item.name }}"
+      loop: "{{ new_host_readiness.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Keep initial MON and MGR placement on node2 before adding hosts
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['orch', 'apply', item, '--placement', '1 node2'] }}"
+      loop: [mon, mgr]
+
+    - name: Enroll each host with its explicit management address
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['orch', 'host', 'add', item.name, item.ip] }}"
+      loop: "{{ ceph_targets }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Apply the final explicit MON and MGR placements
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['orch', 'apply', item.service, '--placement', item.placement] }}"
+      loop:
+        - service: mon
+          placement: '3 node1 node2 node3'
+        - service: mgr
+          placement: '2 node2 node3'
+      loop_control:
+        label: "{{ item.service }}"
+
+    # Only read-only queries are retried. Failed changes are never replayed.
+    - name: Wait for all three MONs to be in quorum
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['quorum_status', '--format', 'json'] }}"
+      register: quorum_poll
+      changed_when: false
+      until:
+        - quorum_poll.rc == 0
+        - (quorum_poll.stdout | from_json).quorum_names | sort == ['node1', 'node2', 'node3']
+        - >-
+          ((quorum_poll.stdout | from_json).monmap.mons
+          | map(attribute='name') | sort) == ['node1', 'node2', 'node3']
+      retries: 60
+      delay: 10
+
+    - name: Wait for one active MGR and one standby across node2 and node3
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['mgr', 'dump', '--format', 'json'] }}"
+      register: mgr_poll
+      changed_when: false
+      until:
+        - mgr_poll.rc == 0
+        - (mgr_poll.stdout | from_json).available | bool
+        - (mgr_poll.stdout | from_json).standbys | length == 1
+        - >-
+          (([(mgr_poll.stdout | from_json).active_name] +
+          ((mgr_poll.stdout | from_json).standbys | map(attribute='name') | list))
+          | map('split', '.') | map('first') | sort) == ['node2', 'node3']
+      retries: 60
+      delay: 10
+
+    - name: Wait for the orchestrator to report the intended running daemons
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['orch', 'ps', '--refresh', '--format', 'json'] }}"
+      register: daemon_poll
+      changed_when: false
+      until:
+        - daemon_poll.rc == 0
+        - >-
+          ((daemon_poll.stdout | from_json | selectattr('daemon_type', 'equalto', 'mon')
+          | map(attribute='hostname') | sort)) == ['node1', 'node2', 'node3']
+        - >-
+          ((daemon_poll.stdout | from_json | selectattr('daemon_type', 'equalto', 'mgr')
+          | map(attribute='hostname') | sort)) == ['node2', 'node3']
+        - >-
+          (daemon_poll.stdout | from_json | selectattr('daemon_type', 'in', ['mon', 'mgr'])
+          | rejectattr('status', 'equalto', 1) | list | length) == 0
+        - >-
+          (daemon_poll.stdout | from_json | selectattr('daemon_type', 'in', ['mon', 'mgr'])
+          | rejectattr('version', 'equalto', '20.2.4') | list | length) == 0
+        - (daemon_poll.stdout | from_json | selectattr('daemon_type', 'equalto', 'osd') | list | length) == 0
+      retries: 60
+      delay: 10
+
+    - name: Read enrolled hosts and labels
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['orch', 'host', 'ls', '--format', 'json'] }}"
+      register: final_hosts
+      changed_when: false
+
+    - name: Require all intended hosts online with admin credentials restricted to node2
+      ansible.builtin.assert:
+        that:
+          - (final_hosts.stdout | from_json | map(attribute='hostname') | sort) == ['node1', 'node2', 'node3']
+          - (final_hosts.stdout | from_json | rejectattr('status', 'equalto', '') | list | length) == 0
+          - >-
+            (final_hosts.stdout | from_json | selectattr('labels', 'contains', '_admin')
+            | map(attribute='hostname') | list) == ['node2']
+
+    - name: Verify enrolled management addresses against the inventory
+      ansible.builtin.assert:
+        that:
+          - item.addr == (hostvars[item.hostname].ansible_host)
+      loop: "{{ final_hosts.stdout | from_json }}"
+      loop_control:
+        label: "{{ item.hostname }}"
+
+    - name: Read final health checks
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['health', '--format', 'json'] }}"
+      register: final_health
+      changed_when: false
+
+    - name: Allow only the expected pre-OSD warning and stop on other health findings
+      ansible.builtin.assert:
+        that:
+          - (final_health.stdout | from_json).status != 'HEALTH_ERR'
+          - >-
+            ((final_health.stdout | from_json).checks.keys()
+            | list | difference(['TOO_FEW_OSDS']) | length) == 0
+        fail_msg: "Unexpected Ceph health checks require review; warnings have not been suppressed."
+
+    - name: Display final cluster reports
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + item.args }}"
+      loop:
+        - name: Cluster status
+          args: [status]
+        - name: Host list
+          args: [orch, host, ls]
+        - name: Daemon placement
+          args: [orch, ps, --refresh]
+        - name: Service specifications
+          args: [orch, ls, --export]
+        - name: Versions
+          args: [versions]
+        - name: Health detail
+          args: [health, detail]
+      loop_control:
+        label: "{{ item.name }}"
+      register: final_reports
+      changed_when: false
+
+    - name: Show report output
+      ansible.builtin.debug:
+        msg:
+          report: "{{ item.item.name }}"
+          stdout: "{{ item.stdout }}"
+          stderr: "{{ item.stderr }}"
+      loop: "{{ final_reports.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Report public-key fingerprint and remaining stage boundary
+      ansible.builtin.debug:
+        msg:
+          - "{{ public_key_fingerprint.stdout }}"
+          - "MON/MGR enrollment stage completed; no OSDs were provisioned."
+          - "Run the OpenStack health and host memory checks from Hermes next."

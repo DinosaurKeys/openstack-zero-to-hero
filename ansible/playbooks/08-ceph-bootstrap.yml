@@ -1,0 +1,365 @@
+---
+- hosts: node2
+  become: true
+  gather_facts: false
+  vars:
+    cephadm_bin: /usr/local/sbin/cephadm-20.2.4
+  pre_tasks:
+    - name: Assert node identity
+      assert:
+        that:
+          - inventory_hostname == 'node2'
+          - ansible_host == '192.168.0.201'
+    - name: Require bootstrap approval
+      assert:
+        that:
+          - ceph_bootstrap_approved | default(false) | bool
+        fail_msg: "ceph_bootstrap_approved must be true"
+  tasks:
+    - name: Verify installed cephadm version
+      ansible.builtin.command:
+        argv:
+          - "{{ cephadm_bin }}"
+          - version
+      register: version_check
+      changed_when: false
+      failed_when: version_check.rc != 0 or version_check.stdout.split()[:3] != ['cephadm', 'version', '20.2.4']
+    - name: Check hostname
+      ansible.builtin.command:
+        argv:
+          - hostname
+      register: hostname_check
+      changed_when: false
+      failed_when: hostname_check.rc != 0 or hostname_check.stdout != 'node2'
+    - name: Check Python available
+      ansible.builtin.command:
+        argv:
+          - python3
+          - --version
+      changed_when: false
+    - name: Check systemd available
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - --version
+      changed_when: false
+    - name: Check Docker available
+      ansible.builtin.command:
+        argv:
+          - docker
+          - --version
+      changed_when: false
+    - name: Check Docker running
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - docker
+      changed_when: false
+    - name: Check LVM2 available
+      ansible.builtin.command:
+        argv:
+          - lvm
+          - version
+      changed_when: false
+    - name: Check ssh available
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -V
+      changed_when: false
+    - name: Check ssh-keygen executable is available without generating keys
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import shutil
+            import sys
+            executable = shutil.which("ssh-keygen")
+            print(executable or "ssh-keygen not found in PATH")
+            sys.exit(0 if executable else 1)
+      changed_when: false
+
+    - name: Require synchronized system time
+      ansible.builtin.command:
+        argv:
+          - timedatectl
+          - show
+          - -p
+          - NTPSynchronized
+          - --value
+      register: time_check
+      changed_when: false
+      failed_when: time_check.rc != 0 or time_check.stdout | trim != 'yes'
+
+    # Ceph 20.2.4 host checks can enable an installed inactive time service.
+    # Require the first service recognized by those checks to be ready already.
+    - name: Inspect time service readiness without changing services
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import subprocess
+            import sys
+            units = [
+                "chrony.service", "chronyd.service",
+                "systemd-timesyncd.service", "ntpd.service", "ntp.service",
+                "ntpsec.service", "openntpd.service", "timemaster.service",
+            ]
+            for unit in units:
+                enabled = subprocess.run(
+                    ["systemctl", "is-enabled", unit],
+                    capture_output=True, text=True, check=False,
+                )
+                active = subprocess.run(
+                    ["systemctl", "is-active", unit],
+                    capture_output=True, text=True, check=False,
+                )
+                if enabled.returncode == 0 and active.stdout.strip() == "active":
+                    print(f"{unit}: enabled and active")
+                    break
+                if enabled.returncode == 0 or "disabled" in enabled.stdout:
+                    sys.exit(
+                        f"Review {unit}: Ceph's host checks may try to enable/start it. "
+                        "No service was changed by this diagnostic."
+                    )
+            else:
+                sys.exit("No enabled, active time service recognized by Ceph was found.")
+      register: time_service_check
+      changed_when: false
+
+    - name: Report time service readiness
+      ansible.builtin.debug:
+        var: time_service_check.stdout
+    - name: Verify management IP on br-mgmt
+      ansible.builtin.command:
+        argv:
+          - ip
+          - -j
+          - -4
+          - address
+          - show
+      register: ip_json
+      changed_when: false
+      failed_when: ip_json.rc != 0
+    - name: Require the management IP and prefix on br-mgmt
+      ansible.builtin.assert:
+        that:
+          - >-
+            (ip_json.stdout | from_json
+            | selectattr('ifname', 'equalto', 'br-mgmt')
+            | map(attribute='addr_info') | flatten
+            | selectattr('local', 'equalto', '192.168.0.201')
+            | selectattr('prefixlen', 'equalto', 24)
+            | list | length) == 1
+        fail_msg: "Expected 192.168.0.201/24 on br-mgmt; review actual addresses."
+    - name: Check free memory
+      ansible.builtin.command:
+        argv:
+          - free
+          - -m
+      register: free_check
+      changed_when: false
+    - debug:
+        var: free_check.stdout
+    - name: Check existing Ceph directories
+      stat:
+        path: "{{ item }}"
+      loop:
+        - /etc/ceph
+        - /var/lib/ceph
+      register: ceph_dirs
+    - name: Reject existing Ceph state
+      fail:
+        msg: "Existing Ceph directory found."
+      when: ceph_dirs.results | selectattr('stat.exists') | list | length > 0
+    - name: Inspect all Docker containers including stopped containers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+          - --all
+          - --no-trunc
+      register: docker_ps
+      changed_when: false
+
+    - name: Reject existing Ceph containers
+      ansible.builtin.assert:
+        that:
+          - docker_ps.stdout is not search('(?i)ceph')
+        fail_msg: "A container name or image contains ceph; review before bootstrap."
+
+    - name: Inspect Ceph systemd unit files
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - list-unit-files
+          - --no-legend
+          - --no-pager
+      register: systemd_units
+      changed_when: false
+
+    - name: Reject existing Ceph systemd unit files
+      ansible.builtin.assert:
+        that:
+          - systemd_units.stdout_lines | map('trim') | select('match', '(?i)^ceph') | list | length == 0
+        fail_msg: "Existing Ceph systemd unit files require review."
+
+    - name: Inspect the complete Ceph TCP port range
+      ansible.builtin.command:
+        argv:
+          - ss
+          - -H
+          - -lntp
+          - "( sport = :3300 or sport = :6789 or ( sport >= :6800 and sport <= :7568 ) )"
+      register: ss_ports
+      changed_when: false
+
+    - name: Require unused Ceph TCP ports and a clean inspection
+      ansible.builtin.assert:
+        that:
+          - ss_ports.stdout | trim | length == 0
+          - ss_ports.stderr | trim | length == 0
+        fail_msg: >-
+          Ceph port conflict or inspection warning:
+          stdout={{ ss_ports.stdout | trim }};
+          stderr={{ ss_ports.stderr | trim }}
+    - name: Bootstrap Ceph
+      ansible.builtin.command:
+        argv:
+          - "{{ cephadm_bin }}"
+          - "--docker"
+          - "--image"
+          - "quay.io/ceph/ceph:v20.2.4"
+          - "bootstrap"
+          - "--mon-ip"
+          - "192.168.0.201"
+          - "--ssh-user"
+          - "openstack"
+          - "--skip-dashboard"
+          - "--skip-monitoring-stack"
+          - "--skip-prepare-host"
+          - "--skip-firewalld"
+          - "--no-cleanup-on-failure"
+    - name: Apply MON placement
+      ansible.builtin.command:
+        argv:
+          - "{{ cephadm_bin }}"
+          - "--docker"
+          - "--image"
+          - "quay.io/ceph/ceph:v20.2.4"
+          - "shell"
+          - "--"
+          - "ceph"
+          - "orch"
+          - "apply"
+          - "mon"
+          - "--placement"
+          - "1 node2"
+    - name: Apply MGR placement
+      ansible.builtin.command:
+        argv:
+          - "{{ cephadm_bin }}"
+          - "--docker"
+          - "--image"
+          - "quay.io/ceph/ceph:v20.2.4"
+          - "shell"
+          - "--"
+          - "ceph"
+          - "orch"
+          - "apply"
+          - "mgr"
+          - "--placement"
+          - "1 node2"
+    - name: Report status
+      ansible.builtin.command:
+        argv:
+          - "{{ cephadm_bin }}"
+          - "--docker"
+          - "--image"
+          - "quay.io/ceph/ceph:v20.2.4"
+          - "shell"
+          - "--"
+          - "ceph"
+          - "-s"
+      register: status_report
+      changed_when: false
+    - debug:
+        var: status_report.stdout
+    - debug:
+        var: status_report.stderr
+    - name: Health detail
+      ansible.builtin.command:
+        argv:
+          - "{{ cephadm_bin }}"
+          - "--docker"
+          - "--image"
+          - "quay.io/ceph/ceph:v20.2.4"
+          - "shell"
+          - "--"
+          - "ceph"
+          - "health"
+          - "detail"
+      register: health_report
+      changed_when: false
+    - debug:
+        var: health_report.stdout
+    - debug:
+        var: health_report.stderr
+    - name: Versions
+      ansible.builtin.command:
+        argv:
+          - "{{ cephadm_bin }}"
+          - "--docker"
+          - "--image"
+          - "quay.io/ceph/ceph:v20.2.4"
+          - "shell"
+          - "--"
+          - "ceph"
+          - "versions"
+      register: versions_report
+      changed_when: false
+    - debug:
+        var: versions_report.stdout
+    - debug:
+        var: versions_report.stderr
+    - name: Orchestrator state
+      ansible.builtin.command:
+        argv:
+          - "{{ cephadm_bin }}"
+          - "--docker"
+          - "--image"
+          - "quay.io/ceph/ceph:v20.2.4"
+          - "shell"
+          - "--"
+          - "ceph"
+          - "orch"
+          - "ls"
+          - "--export"
+      register: orch_report
+      changed_when: false
+    - debug:
+        var: orch_report.stdout
+    - debug:
+        var: orch_report.stderr
+    - name: Orchestrator refresh
+      ansible.builtin.command:
+        argv:
+          - "{{ cephadm_bin }}"
+          - "--docker"
+          - "--image"
+          - "quay.io/ceph/ceph:v20.2.4"
+          - "shell"
+          - "--"
+          - "ceph"
+          - "orch"
+          - "ps"
+          - "--refresh"
+      register: orch_ps_report
+      changed_when: false
+    - debug:
+        var: orch_ps_report.stdout
+    - debug:
+        var: orch_ps_report.stderr
