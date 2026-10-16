@@ -1,0 +1,71 @@
+---
+- hosts: node2
+  become: true
+  gather_facts: false
+  vars:
+    cephadm_path: /usr/local/sbin/cephadm-20.2.4
+  pre_tasks:
+    - name: Assert inventory and connection
+      assert:
+        that:
+          - inventory_hostname == 'node2'
+          - ansible_host == '192.168.0.201'
+    - name: Require approval
+      assert:
+        that:
+          - cephadm_install_approved | default(false) | bool
+        fail_msg: "cephadm_install_approved must be true"
+  tasks:
+    - name: Inspect existing file
+      stat:
+        path: "{{ cephadm_path }}"
+        follow: false
+      register: cephadm_stat
+      changed_when: false
+    - name: Reject bad existing destination
+      fail:
+        msg: "Reject: symlink/non-regular/bad owner/mode/version mismatch"
+      when:
+        - cephadm_stat.stat.exists
+        - cephadm_stat.stat.islnk or (not cephadm_stat.stat.isreg) or cephadm_stat.stat.pw_name != 'root' or cephadm_stat.stat.gr_name != 'root' or (cephadm_stat.stat.mode != '0755')
+    - name: Download cephadm
+      ansible.builtin.get_url:
+        url: https://download.ceph.com/rpm-20.2.4/el9/noarch/cephadm
+        dest: "{{ cephadm_path }}"
+        owner: root
+        group: root
+        mode: "0755"
+        validate_certs: true
+        force: false
+      when: not cephadm_stat.stat.exists
+
+    - name: Verify executable version
+      ansible.builtin.command:
+        argv:
+          - "{{ cephadm_path }}"
+          - version
+      register: version_out
+      changed_when: false
+
+    - name: Require exactly version 20.2.4
+      ansible.builtin.assert:
+        that:
+          - "version_out.stdout.split()[:3] == ['cephadm', 'version', '20.2.4']"
+        fail_msg: "Unexpected version: {{ version_out.stdout }}"
+
+    - name: Calculate the actual SHA256
+      ansible.builtin.stat:
+        path: "{{ cephadm_path }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+        get_mime: false
+        get_attributes: false
+      register: cephadm_checksum
+
+    - name: Report actual executable details
+      ansible.builtin.debug:
+        msg:
+          path: "{{ cephadm_path }}"
+          version: "{{ version_out.stdout }}"
+          sha256: "{{ cephadm_checksum.stat.checksum }}"
