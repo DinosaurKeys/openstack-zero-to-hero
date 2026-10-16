@@ -1,8 +1,8 @@
 # Ceph Deployment Plan
 
-Status: DRAFT — standalone cephadm installation on node2 is complete.
-Cluster bootstrap, host enrollment, SSH authorization changes, disk cleanup,
-and OSD creation remain unapproved.
+Status: DRAFT — bootstrap (08) and host enrollment (09) complete.
+Cluster disk cleanup, OSD memory policy, OSD creation, and OpenStack
+storage integration remain unapproved.
 
 ## Purpose and Scope
 

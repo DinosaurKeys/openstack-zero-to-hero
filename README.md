@@ -365,6 +365,12 @@ Defines the staged Ceph deployment plan for all three OpenStack nodes.
 
 Records the observed standalone executable installation on node2, version verification, SHA256 identity, and idempotence results.
 
+### Chapter 26 — Ceph Bootstrap and Host Enrollment
+
+[Ceph Bootstrap and Host Enrollment](docs/26-ceph-bootstrap-and-host-enrollment.md)
+
+Records the completed bootstrap (08) and enrollment (09) stages: FSID, MON/MGR placement, three-host enrollment, health warning review, post-enrollment RAM, and preserved unapproved gates.
+
 ---
 
 ### OpenStack Reboot and Recovery Runbook
