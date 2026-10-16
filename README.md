@@ -353,6 +353,18 @@ Proposes the design for Ceph deployment on the three OpenStack nodes.
 
 Documents diagnostic-tool installation, completed baseline checks, and remaining manual review.
 
+### Chapter 24 — Ceph Deployment Plan
+
+[Ceph Deployment Plan](docs/24-ceph-deployment-plan.md)
+
+Defines the staged Ceph deployment plan for all three OpenStack nodes.
+
+### Chapter 25 — Cephadm Installation and Validation
+
+[Cephadm Installation and Validation](docs/25-cephadm-installation.md)
+
+Records the observed standalone executable installation on node2, version verification, SHA256 identity, and idempotence results.
+
 ---
 
 ### OpenStack Reboot and Recovery Runbook
