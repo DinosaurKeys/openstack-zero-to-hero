@@ -1,8 +1,8 @@
 # Ceph Deployment Plan
 
-Status: DRAFT — bootstrap (08) and host enrollment (09) complete.
-Cluster disk cleanup, OSD memory policy, OSD creation, and OpenStack
-storage integration remain unapproved.
+Status: DRAFT — bootstrap (08), host enrollment (09), and memory-policy (10) complete.
+Cluster disk cleanup, OSD creation, and OpenStack storage integration
+remain unapproved.
 
 ## Purpose and Scope
 
@@ -15,8 +15,7 @@ Ansible automation before requesting execution approval. Hermes AI prepares
 files; the human operator reviews and runs approved infrastructure commands.
 
 Do not change the existing inventory, preflight playbook, or diagnostic-tools
-playbook while preparing this plan. Continue on
-`feature/ceph-04-deployment-plan`.
+playbook while preparing this plan. Use a dedicated feature branch for subsequent changes.
 
 ## Recorded Baseline
 
@@ -108,8 +107,7 @@ After approved installation, verify on node2:
 /usr/local/sbin/cephadm-20.2.4 version
 ```
 
-Status: node2 executable installed; see [chapter 25](25-cephadm-installation.md).
-Bootstrap, host enrollment, disk cleanup, and OSD creation remain unapproved.
+Status: node2 executable installed; bootstrap and host enrollment are complete (see [chapter 26](26-ceph-bootstrap-and-host-enrollment.md) and [chapter 27](27-ceph-osd-preparation.md)). Disk cleanup and OSD creation remain unapproved.
 Require release **20.2.4**, not “20.2.4 or later”. Stop on a download error,
 unexpected existing file, execution error, or version mismatch.
 
@@ -256,6 +254,7 @@ After OSD creation, verify the running daemons as described in Stage 7.
 The 2 GiB value is a soft target. Budget at least 2.4 GiB per OSD as the
 provisional allowance, plus separate headroom for MON/MGR, the OS, OpenStack,
 workload growth, and recovery. This does not enforce a 2 GiB or 2.4 GiB ceiling.
+Status: Applied and repeat-run validated; see [chapter 27](27-ceph-osd-preparation.md).
 
 ## Stage 6 — Separate Cleanup Approval, Then One OSD at a Time
 
