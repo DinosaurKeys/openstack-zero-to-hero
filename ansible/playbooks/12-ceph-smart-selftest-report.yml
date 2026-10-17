@@ -1,0 +1,197 @@
+---
+- name: Report SMART execution and self-test history without changing disks
+  hosts: openstack
+  become: true
+  gather_facts: false
+  vars:
+    ceph_smart_devices:
+      node1:
+        ip: 192.168.0.200
+        path: /dev/disk/by-id/ata-KINGSTON_SUV400S37240G_50026B7766070422
+        serial: "50026B7766070422"
+      node2:
+        ip: 192.168.0.201
+        path: /dev/disk/by-id/ata-ADATA_SU630_4P3521354988
+        serial: "4P3521354988"
+      node3:
+        ip: 192.168.0.202
+        path: /dev/disk/by-id/ata-KINGSTON_SA400S37240G_50026B768317883A
+        serial: "50026B768317883A"
+
+  tasks:
+    - name: Require a known host and the reviewed inventory address
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname in ceph_smart_devices
+          - ansible_host == ceph_smart_devices[inventory_hostname].ip
+
+    - name: Select this host's SATA mapping
+      ansible.builtin.set_fact:
+        smart_device: "{{ ceph_smart_devices[inventory_hostname] }}"
+
+    - name: Read the resolved disk identity
+      ansible.builtin.command:
+        argv: [lsblk, --json, --nodeps, --output, 'PATH,TYPE,TRAN,SERIAL', "{{ smart_device.path }}"]
+      register: smart_lsblk
+      changed_when: false
+
+    - name: Require the intended whole SATA disk and exclude OS NVMe
+      ansible.builtin.assert:
+        that:
+          - selected_disks | length == 1
+          - selected_disks[0].type == 'disk'
+          - selected_disks[0].tran == 'sata'
+          - selected_disks[0].path is match('^/dev/sd[a-z]+$')
+          - selected_disks[0].serial == smart_device.serial
+        fail_msg: "Resolved disk identity differs from the reviewed SATA mapping."
+      vars:
+        selected_disks: "{{ (smart_lsblk.stdout | from_json).blockdevices }}"
+
+    # Prefer GP log 0x07. Let smartctl fall back to the legacy log if needed.
+    # Preserve JSON, original text, stderr and the bitmask even on nonzero exit.
+    - name: Read identity, health, attributes, progress and preferred logs
+      ansible.builtin.command:
+        argv:
+          - smartctl
+          - --json=o
+          - -i
+          - -H
+          - -c
+          - -A
+          - -l
+          - xselftest,selftest
+          - -l
+          - xerror,error
+          - "{{ smart_device.path }}"
+      register: smart_report
+      changed_when: false
+      failed_when: false
+
+    - name: Show all raw evidence before interpreting the result
+      ansible.builtin.debug:
+        msg:
+          device: "{{ smart_device.path }}"
+          expected_serial: "{{ smart_device.serial }}"
+          rc: "{{ smart_report.rc }}"
+          stderr: "{{ smart_report.stderr | default('') }}"
+          stdout: "{{ smart_report.stdout | default('') }}"
+
+    - name: Require JSON output from smartctl
+      ansible.builtin.assert:
+        that:
+          - smart_report.stdout | default('') | trim | length > 0
+        fail_msg: "No SMART JSON was returned. Review the command evidence above."
+
+    - name: Decode the report
+      ansible.builtin.set_fact:
+        smart_data: "{{ smart_report.stdout | from_json }}"
+
+    - name: Verify SMART identity and expose missing execution data
+      ansible.builtin.assert:
+        that:
+          - smart_data.serial_number | default('') == smart_device.serial
+          - smart_data.device.protocol | default('') == 'ATA'
+          - smart_data.smartctl.exit_status | default(-1) == smart_report.rc
+        fail_msg: "SMART identity or exit-status metadata is missing or inconsistent. Raw evidence is above."
+
+    - name: Select the actual log format and execution byte
+      ansible.builtin.set_fact:
+        smart_log_format: >-
+          {{ 'extended' if smart_data.ata_smart_self_test_log.extended is defined
+             else ('standard' if smart_data.ata_smart_self_test_log.standard is defined else 'unavailable') }}
+        smart_execution_value: "{{ smart_data.ata_smart_data.self_test.status.value | default(-1) }}"
+
+    - name: Select log details without treating an absent log as a pass
+      ansible.builtin.set_fact:
+        smart_log: "{{ smart_data.ata_smart_self_test_log[smart_log_format] if smart_log_format != 'unavailable' else {} }}"
+
+    - name: Select the latest logged entry and decode the exit bitmask
+      ansible.builtin.set_fact:
+        smart_latest: "{{ (smart_log.table | default([]) | first) | default({}) }}"
+        smart_exit_flags:
+          command_parse_error: "{{ smart_report.rc >= 0 and smart_report.rc % 2 == 1 }}"
+          device_open_or_identify_error: "{{ smart_report.rc >= 0 and smart_report.rc // 2 % 2 == 1 }}"
+          smart_command_or_checksum_error: "{{ smart_report.rc >= 0 and smart_report.rc // 4 % 2 == 1 }}"
+          disk_failing: "{{ smart_report.rc >= 0 and smart_report.rc // 8 % 2 == 1 }}"
+          current_prefailure_attribute: "{{ smart_report.rc >= 0 and smart_report.rc // 16 % 2 == 1 }}"
+          historical_threshold_failure: "{{ smart_report.rc >= 0 and smart_report.rc // 32 % 2 == 1 }}"
+          error_log_records: "{{ smart_report.rc >= 0 and smart_report.rc // 64 % 2 == 1 }}"
+          selftest_log_errors: "{{ smart_report.rc >= 0 and smart_report.rc // 128 % 2 == 1 }}"
+          unexpected_process_exit: "{{ smart_report.rc < 0 or smart_report.rc > 255 }}"
+
+    # Reviewed 2026-10-17: both standard and extended logs for this exact
+    # disk/firmware reported the same completed long test at 3566 power-on hours.
+    # This is a report-format exception, not disk-use or cleanup approval.
+    - name: Identify the reviewed node1 revision-zero report format
+      ansible.builtin.set_fact:
+        smart_reviewed_revision_zero: >-
+          {{ inventory_hostname == 'node1'
+             and smart_data.serial_number | default('') == '50026B7766070422'
+             and smart_data.model_name | default('') == 'KINGSTON SUV400S37240G'
+             and smart_data.firmware_version | default('') == '0C3FD6SD'
+             and smart_log_format == 'extended'
+             and smart_log.revision | default(-1) == 0
+             and smart_log.count | default(0) is integer
+             and smart_log.count | default(0) > 0
+             and smart_latest.type.value | default(-1) == 2 }}
+
+    - name: Classify execution and history separately from overall SMART health
+      ansible.builtin.set_fact:
+        smart_test_state: >-
+          {% if smart_report.rc < 0 or smart_report.rc > 255 or smart_report.rc % 8 != 0 %}
+          UNKNOWN_INSPECTION_ERROR
+          {% elif smart_execution_value is not integer or smart_execution_value < 0 or smart_execution_value > 255 %}
+          UNKNOWN_EXECUTION_STATUS
+          {% elif smart_execution_value // 16 == 15 and smart_execution_value % 16 <= 9 %}
+          RUNNING
+          {% elif smart_execution_value // 16 == 1 %}
+          ABORTED
+          {% elif smart_execution_value // 16 == 2 %}
+          INTERRUPTED
+          {% elif smart_execution_value // 16 in [3, 4, 5, 6, 7, 8] %}
+          FAILED
+          {% elif smart_execution_value != 0 or smart_log_format == 'unavailable' %}
+          UNKNOWN_EXECUTION_OR_LOG
+          {% elif smart_log.count | default(-1) == 0 and smart_latest | length == 0 %}
+          NO_TEST_RECORDED
+          {% elif (smart_log.revision | default(-1) != 1 and not smart_reviewed_revision_zero) or smart_latest.status.value | default(-1) is not integer %}
+          UNKNOWN_LOG_DATA
+          {% elif smart_latest.status.value | default(-1) == 0 %}
+          COMPLETED_WITHOUT_ERROR
+          {% elif smart_latest.status.value | default(-1) >= 16 and smart_latest.status.value | default(-1) < 32 %}
+          ABORTED
+          {% elif smart_latest.status.value | default(-1) >= 32 and smart_latest.status.value | default(-1) < 48 %}
+          INTERRUPTED
+          {% elif smart_latest.status.value | default(-1) >= 48 and smart_latest.status.value | default(-1) < 144 %}
+          FAILED
+          {% else %}
+          UNKNOWN_OR_INCONSISTENT_LOG
+          {% endif %}
+
+    - name: Show the interpreted report and unresolved findings
+      ansible.builtin.debug:
+        msg:
+          state: "{{ smart_test_state | trim }}"
+          overall_smart_passed: "{{ smart_data.smart_status.passed | default('not reported') }}"
+          execution_status: "{{ smart_data.ata_smart_data.self_test.status | default({}) }}"
+          log_format: "{{ smart_log_format }}"
+          log_revision: "{{ smart_log.revision | default('not reported') }}"
+          reviewed_revision_zero_exception: "{{ smart_reviewed_revision_zero }}"
+          disk_use_approved: false
+          latest_logged_test: "{{ smart_latest }}"
+          latest_logged_test_is_long: "{{ smart_latest.type.value | default(-1) == 2 }}"
+          exit_flags: "{{ smart_exit_flags }}"
+          notes:
+            - "COMPLETED_WITHOUT_ERROR describes the latest logged test, not proof that this run started it. Check its type and lifetime_hours."
+            - "RUNNING and NO_TEST_RECORDED are pending results, not passed tests. SMART overall PASSED alone is insufficient."
+            - "Revision 0 is reviewed only for node1 serial 50026B7766070422, model KINGSTON SUV400S37240G, firmware 0C3FD6SD, with an extended-log long-test entry. This header warning remains recorded; other unexpected revisions still require review."
+            - "Node1 Runtime_Bad_Block=11 and node2 vendor-counter/log anomalies remain open even if a test passes."
+            - "This report does not authorize disk cleanup, OSD provisioning or OpenStack changes."
+
+    - name: Flag command errors, SMART findings and unsuccessful or unclear tests after reporting evidence
+      ansible.builtin.assert:
+        that:
+          - smart_report.rc == 0
+          - smart_data.smart_status.passed | default(false) is sameas true
+          - smart_test_state | trim in ['RUNNING', 'NO_TEST_RECORDED', 'COMPLETED_WITHOUT_ERROR']
+        fail_msg: "Review the evidence and decoded flags above. Pending tests and successful inspection do not establish disk readiness."

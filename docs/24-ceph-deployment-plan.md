@@ -256,6 +256,9 @@ provisional allowance, plus separate headroom for MON/MGR, the OS, OpenStack,
 workload growth, and recovery. This does not enforce a 2 GiB or 2.4 GiB ceiling.
 Status: Applied and repeat-run validated; see [chapter 27](27-ceph-osd-preparation.md).
 
+---
+2026-10-17 update (disk validation stage): SMART long self-test completed on all three SATA devices; see [chapter 28](28-ceph-disk-validation.md). The memory-policy stage and bootstrap/enrollment results above are preserved as historical records.
+
 ## Stage 6 — Separate Cleanup Approval, Then One OSD at a Time
 
 **Stop before this stage until the exact cleanup procedure has been written,

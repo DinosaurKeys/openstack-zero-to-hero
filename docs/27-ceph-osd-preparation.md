@@ -51,3 +51,6 @@ This stage prepares the memory policy for OSDs but does not authorize disk clean
 2. Explicit approval for OSD creation (one at a time, with validation).
 3. Verify runtime settings and monitor actual OSD memory usage and host RAM headroom.
 4. Review of OpenStack integration prerequisites (Cinder, Glance, Nova, and libvirt Ceph client compatibility and authentication advisory).
+
+---
+2026-10-17 update: SMART long self-test completed; see [chapter 28](28-ceph-disk-validation.md). The memory-policy results, observed FSID, and preserved SMART findings above remain historical records.

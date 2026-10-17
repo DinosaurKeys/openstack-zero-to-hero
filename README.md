@@ -377,6 +377,12 @@ Records the completed bootstrap (08) and enrollment (09) stages: FSID, MON/MGR p
 
 Records the observed results from applying the OSD memory policy stage: Ceph 20.2.4, FSID c692f389-c98e-11f1-97b4-002324ebf501, playbook ansible/playbooks/10-ceph-osd-memory-policy.yml, Node2 administers central policy, osd_memory_target_autotune false, osd_memory_target 2147483648 bytes, initial run ok=19 changed=1, repeat run ok=18 changed=0 skipped=1, OpenStack HEALTHY 14 checks passed, zero OSDs, no disks cleaned or provisioned.
 
+### Chapter 28 — Ceph Disk Validation
+
+[Ceph Disk Validation](docs/28-ceph-disk-validation.md)
+
+Records the SMART long self-test results (2026-10-17): approved start report (playbook 11), read-only report (playbook 12), all three disks completed without error, node1 revision-zero exception reviewed, unresolved SMART findings preserved (node1 bad block, node2 vendor counters), disk cleanup and OSD creation remain unapproved.
+
 ---
 
 ### OpenStack Reboot and Recovery Runbook
