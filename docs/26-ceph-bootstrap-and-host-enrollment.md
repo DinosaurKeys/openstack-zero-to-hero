@@ -1,8 +1,8 @@
 # Ceph Bootstrap and Host Enrollment
 
-Status: Bootstrap (08) and enrollment (09) completed 2026-10-16.
-Disk cleanup, OSD creation, memory-tuning approval, and OpenStack
-integration review remain unapproved.
+Status: Bootstrap (08) and enrollment (09) completed 2026-10-16. See [Chapter 27](27-ceph-osd-preparation.md) for OSD preparation.
+The OSD memory policy was subsequently applied; see [chapter 27](27-ceph-osd-preparation.md).
+Disk cleanup, OSD creation, and OpenStack integration review remain unapproved.
 
 ## Version and Identity
 
@@ -58,7 +58,7 @@ not an in-place restart of this one.
 ## Unapproved Gates Preserved
 
 - Disk cleanup (Stage 6) and per-host SATA identity verification.
-- OSD memory policy (`osd_memory_target_autotune false`, target 2147483648).
+- Verify the applied memory policy and actual resource use in running OSDs after OSD creation.
 - Actual OSD creation, replication validation, and recovery headroom review.
 - Cinder/Glance/Nova RBD integration and the Ceph authentication advisory.
 - Defer dashboard, Prometheus/Grafana, CephFS, RGW.

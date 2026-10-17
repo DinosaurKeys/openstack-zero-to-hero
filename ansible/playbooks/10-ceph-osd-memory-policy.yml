@@ -1,0 +1,181 @@
+---
+- name: Set the pre-OSD Ceph memory policy
+  hosts: node2
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    cephadm_bin: /usr/local/sbin/cephadm-20.2.4
+    ceph_image: quay.io/ceph/ceph:v20.2.4
+    ceph_memory_policy:
+      - name: osd_memory_target_autotune
+        value: "false"
+      - name: osd_memory_target
+        value: "2147483648"
+    ceph_cli_argv:
+      - "{{ cephadm_bin }}"
+      - --docker
+      - --image
+      - "{{ ceph_image }}"
+      - shell
+      - --fsid
+      - "{{ ceph_expected_fsid }}"
+      - --
+      - ceph
+
+  pre_tasks:
+    - name: Require the intended coordinator, cluster identity, and approval
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname == 'node2'
+          - ansible_host == '192.168.0.201'
+          - ceph_expected_fsid is defined
+          - ceph_expected_fsid is string
+          - ceph_expected_fsid is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+          - ceph_osd_memory_policy_approved | default(false) | bool
+        fail_msg: "Supply the expected FSID and explicit ceph_osd_memory_policy_approved=true; this stage targets node2 only."
+
+  tasks:
+    - name: Verify the pinned cephadm executable
+      ansible.builtin.command:
+        argv: ["{{ cephadm_bin }}", version]
+      register: cephadm_version
+      changed_when: false
+
+    - name: Require exactly cephadm 20.2.4
+      ansible.builtin.assert:
+        that:
+          - "cephadm_version.stdout.split()[:3] == ['cephadm', 'version', '20.2.4']"
+        fail_msg: "Unexpected cephadm version: {{ cephadm_version.stdout }}"
+
+    - name: Read the actual cluster identity and health
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['status', '--format', 'json'] }}"
+      register: ceph_status_result
+      changed_when: false
+
+    - name: Require the intended cluster and only the expected pre-OSD warning
+      ansible.builtin.assert:
+        that:
+          - (ceph_status_result.stdout | from_json).fsid == ceph_expected_fsid
+          - (ceph_status_result.stdout | from_json).health.status in ['HEALTH_OK', 'HEALTH_WARN']
+          - ((ceph_status_result.stdout | from_json).health.checks.keys() | list | difference(['TOO_FEW_OSDS']) | length) == 0
+        fail_msg: "Cluster identity or health differs from the expected pre-OSD baseline."
+
+    - name: Read actual OSD IDs
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['osd', 'ls', '--format', 'json'] }}"
+      register: ceph_osd_ids_result
+      changed_when: false
+
+    - name: Require zero OSDs before changing this preparation policy
+      ansible.builtin.assert:
+        that:
+          - (ceph_osd_ids_result.stdout | from_json) is sequence
+          - (ceph_osd_ids_result.stdout | from_json) is not string
+          - (ceph_osd_ids_result.stdout | from_json) is not mapping
+          - (ceph_osd_ids_result.stdout | from_json | length) == 0
+        fail_msg: "This pre-OSD stage requires an empty OSD ID list; review existing OSDs separately."
+
+    - name: Read the central configuration as structured JSON
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['config', 'dump', '--format', 'json'] }}"
+      register: ceph_config_dump_result
+      changed_when: false
+
+    - name: Require a configuration list
+      ansible.builtin.assert:
+        that:
+          - (ceph_config_dump_result.stdout | from_json) is sequence
+          - (ceph_config_dump_result.stdout | from_json) is not string
+          - (ceph_config_dump_result.stdout | from_json) is not mapping
+
+    - name: Select explicit entries for the two memory options
+      ansible.builtin.set_fact:
+        ceph_memory_entries: "{{ ceph_config_dump_result.stdout | from_json | selectattr('name', 'in', ceph_memory_policy | map(attribute='name') | list) | list }}"
+
+    - name: Report explicit memory settings and their scopes
+      ansible.builtin.debug:
+        var: ceph_memory_entries
+
+    - name: Require the documented Ceph configuration entry structure
+      ansible.builtin.assert:
+        that:
+          - item.section is string
+          - item.mask is string
+          - item.value is string
+        fail_msg: "Unexpected configuration entry structure: {{ item }}"
+      loop: "{{ ceph_memory_entries }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # Unmasked global values are superseded by the explicit osd policy.
+    # Preserve matching scoped entries; never remove or rewrite overrides.
+    - name: Reject conflicting per-OSD or masked memory settings
+      ansible.builtin.assert:
+        that:
+          - >-
+            (item.section not in ['global', 'osd'] and not (item.section is match('^osd[.]')))
+            or (item.section in ['global', 'osd'] and item.mask == '')
+            or item.value == (ceph_memory_policy | selectattr('name', 'equalto', item.name) | first).value
+        fail_msg: "Conflicting memory override; review before proceeding: {{ item }}"
+      loop: "{{ ceph_memory_entries }}"
+      loop_control:
+        label: "{{ item.section }}/{{ item.mask }} {{ item.name }}={{ item.value }}"
+
+    - name: Read effective central settings before the change
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['config', 'get', 'osd', item.name] }}"
+      loop: "{{ ceph_memory_policy }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: ceph_memory_before
+      changed_when: false
+
+    - name: Report the effective central values before the change
+      ansible.builtin.debug:
+        msg: "{{ item.item.name }}={{ item.stdout | trim }}"
+      loop: "{{ ceph_memory_before.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Persist only missing or different unmasked OSD policy values
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['config', 'set', 'osd', item.name, item.value] }}"
+      loop: "{{ ceph_memory_policy }}"
+      loop_control:
+        label: "{{ item.name }}={{ item.value }}"
+      when: >-
+        (ceph_memory_entries
+         | selectattr('section', 'equalto', 'osd')
+         | selectattr('mask', 'equalto', '')
+         | selectattr('name', 'equalto', item.name)
+         | selectattr('value', 'equalto', item.value)
+         | list | length) == 0
+
+    - name: Read effective central settings after the change
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['config', 'get', 'osd', item.name] }}"
+      loop: "{{ ceph_memory_policy }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: ceph_memory_after
+      changed_when: false
+
+    - name: Assert both central policy values match the intended settings
+      ansible.builtin.assert:
+        that:
+          - item.stdout | trim == item.item.value
+        success_msg: "{{ item.item.name }}={{ item.stdout | trim }}"
+        fail_msg: "Unexpected value for {{ item.item.name }}: {{ item.stdout }}"
+      loop: "{{ ceph_memory_after.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Explain the boundary of this policy
+      ansible.builtin.debug:
+        msg:
+          - "The central OSD policy is autotune=false and target=2147483648 bytes (2 GiB)."
+          - "This is a soft target; allow at least 2.4 GiB per OSD plus other host workloads."
+          - "After OSD creation, verify each daemon's runtime configuration and actual memory use."
+          - "Disk-health review, cleanup, and OSD provisioning remain separate stages."

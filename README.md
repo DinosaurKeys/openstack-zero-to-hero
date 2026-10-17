@@ -371,6 +371,12 @@ Records the observed standalone executable installation on node2, version verifi
 
 Records the completed bootstrap (08) and enrollment (09) stages: FSID, MON/MGR placement, three-host enrollment, health warning review, post-enrollment RAM, and preserved unapproved gates.
 
+### Chapter 27 — Ceph OSD Preparation
+
+[Ceph OSD Preparation](docs/27-ceph-osd-preparation.md)
+
+Records the observed results from applying the OSD memory policy stage: Ceph 20.2.4, FSID c692f389-c98e-11f1-97b4-002324ebf501, playbook ansible/playbooks/10-ceph-osd-memory-policy.yml, Node2 administers central policy, osd_memory_target_autotune false, osd_memory_target 2147483648 bytes, initial run ok=19 changed=1, repeat run ok=18 changed=0 skipped=1, OpenStack HEALTHY 14 checks passed, zero OSDs, no disks cleaned or provisioned.
+
 ---
 
 ### OpenStack Reboot and Recovery Runbook
