@@ -1,0 +1,218 @@
+---
+- name: Start approved background SMART long tests before OSD provisioning
+  hosts: openstack
+  become: true
+  gather_facts: false
+  strategy: linear
+  any_errors_fatal: true
+  vars:
+    cephadm_bin: /usr/local/sbin/cephadm-20.2.4
+    ceph_image: quay.io/ceph/ceph:v20.2.4
+    ceph_cli_argv:
+      - "{{ cephadm_bin }}"
+      - --docker
+      - --image
+      - "{{ ceph_image }}"
+      - shell
+      - --fsid
+      - "{{ ceph_expected_fsid }}"
+      - --
+      - ceph
+    ceph_smart_devices:
+      node1:
+        ip: 192.168.0.200
+        path: /dev/disk/by-id/ata-KINGSTON_SUV400S37240G_50026B7766070422
+        serial: "50026B7766070422"
+      node2:
+        ip: 192.168.0.201
+        path: /dev/disk/by-id/ata-ADATA_SU630_4P3521354988
+        serial: "4P3521354988"
+      node3:
+        ip: 192.168.0.202
+        path: /dev/disk/by-id/ata-KINGSTON_SA400S37240G_50026B768317883A
+        serial: "50026B768317883A"
+
+  pre_tasks:
+    - name: Require approval, cluster identity, and all three intended hosts
+      ansible.builtin.assert:
+        that:
+          - ceph_smart_selftest_approved | default(false) | bool
+          - ceph_expected_fsid is defined
+          - ceph_expected_fsid is string
+          - ceph_expected_fsid is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+          - ansible_play_hosts_all | sort == ['node1', 'node2', 'node3']
+          - inventory_hostname in ceph_smart_devices
+        fail_msg: "Approval and the expected FSID are required. Run against node1, node2 and node3 together, without --limit."
+
+    - name: Verify the inventory address and select the approved SATA mapping
+      ansible.builtin.assert:
+        that:
+          - ansible_host == ceph_smart_devices[inventory_hostname].ip
+          - hostvars['node2'].ansible_host == '192.168.0.201'
+        fail_msg: "Inventory addresses differ from the reviewed three-node lab."
+
+    - name: Select this host's approved disk
+      ansible.builtin.set_fact:
+        smart_device: "{{ ceph_smart_devices[inventory_hostname] }}"
+
+  tasks:
+    - name: Read cluster status through node2
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['status', '--format', 'json'] }}"
+      delegate_to: node2
+      run_once: true
+      register: ceph_status_result
+      changed_when: false
+
+    - name: Require the intended cluster and only the expected pre-OSD warning
+      ansible.builtin.assert:
+        that:
+          - ceph_status.fsid == ceph_expected_fsid
+          - ceph_status.health.checks is mapping
+          - >-
+            (ceph_status.health.status == 'HEALTH_OK' and
+             ceph_status.health.checks | length == 0) or
+            (ceph_status.health.status == 'HEALTH_WARN' and
+             ceph_status.health.checks.keys() | list | sort == ['TOO_FEW_OSDS'])
+        fail_msg: "Unexpected cluster identity or health. Review before starting tests."
+      vars:
+        ceph_status: "{{ ceph_status_result.stdout | from_json }}"
+      run_once: true
+
+    - name: Read OSD IDs through node2
+      ansible.builtin.command:
+        argv: "{{ ceph_cli_argv + ['osd', 'ls', '--format', 'json'] }}"
+      delegate_to: node2
+      run_once: true
+      register: ceph_osd_ids_result
+      changed_when: false
+
+    - name: Require zero OSDs for this preparation stage
+      ansible.builtin.assert:
+        that:
+          - ceph_osd_ids_result.stdout | from_json == []
+        fail_msg: "Existing OSDs found; this pre-OSD test playbook must be reviewed again."
+      run_once: true
+
+    - name: Inspect the resolved device without reading file contents
+      ansible.builtin.stat:
+        path: "{{ smart_device.path }}"
+        follow: true
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      register: smart_device_stat
+
+    - name: Require a block device
+      ansible.builtin.assert:
+        that:
+          - smart_device_stat.stat.exists
+          - smart_device_stat.stat.isblk | default(false)
+        fail_msg: "The approved SATA path is missing or is not a block device."
+
+    - name: Read structured identity of the selected whole disk
+      ansible.builtin.command:
+        argv: [lsblk, --json, --nodeps, --output, 'PATH,TYPE,TRAN,SERIAL', "{{ smart_device.path }}"]
+      register: smart_lsblk
+      changed_when: false
+
+    - name: Require exactly the intended SATA disk and exclude OS NVMe
+      ansible.builtin.assert:
+        that:
+          - selected_disks | length == 1
+          - selected_disks[0].type == 'disk'
+          - selected_disks[0].tran == 'sata'
+          - selected_disks[0].path is match('^/dev/sd[a-z]+$')
+          - selected_disks[0].serial == smart_device.serial
+        fail_msg: "Resolved disk type, transport, path or serial differs from the approved mapping."
+      vars:
+        selected_disks: "{{ (smart_lsblk.stdout | from_json).blockdevices }}"
+
+    - name: Read SMART identity, overall health, capabilities and execution status
+      ansible.builtin.command:
+        argv: [smartctl, --json=o, -i, -H, -c, "{{ smart_device.path }}"]
+      register: smart_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Show raw inspection evidence before checking it
+      ansible.builtin.debug:
+        msg:
+          rc: "{{ smart_probe.rc }}"
+          stderr: "{{ smart_probe.stderr | default('') }}"
+          stdout: "{{ smart_probe.stdout | default('') }}"
+
+    - name: Require a successful SMART query
+      ansible.builtin.assert:
+        that:
+          - smart_probe.rc == 0
+        fail_msg: "SMART inspection returned a finding or command error; review the evidence above. No tests have been started."
+
+    - name: Decode SMART inspection
+      ansible.builtin.set_fact:
+        smart_info: "{{ smart_probe.stdout | from_json }}"
+
+    - name: Require matching identity, enabled SMART and unambiguous test support
+      ansible.builtin.assert:
+        that:
+          - smart_info.serial_number == smart_device.serial
+          - smart_info.device.protocol == 'ATA'
+          - smart_info.smartctl.exit_status == 0
+          - smart_info.smart_support.available is sameas true
+          - smart_info.smart_support.enabled is sameas true
+          - smart_info.smart_status.passed is sameas true
+          - smart_info.ata_smart_data.capabilities.self_tests_supported is sameas true
+          - smart_info.ata_smart_data.self_test.status.value is integer
+          - smart_info.ata_smart_data.self_test.status.value >= 0
+          - smart_info.ata_smart_data.self_test.status.value <= 255
+          - smart_info.ata_smart_data.self_test.status.value // 16 in [0, 1, 2, 3, 4, 5, 6, 7, 8, 15]
+          - smart_info.ata_smart_data.self_test.status.value % 16 <= 9
+          - smart_info.ata_smart_data.self_test.polling_minutes.extended is integer
+          - smart_info.ata_smart_data.self_test.polling_minutes.extended > 0
+        fail_msg: "Disk identity, SMART support, overall health or execution status is unclear. No tests have been started."
+
+    - name: Determine running state from the ATA execution-status byte
+      ansible.builtin.set_fact:
+        smart_running: "{{ smart_info.ata_smart_data.self_test.status.value // 16 == 15 }}"
+
+    - name: Report the reviewed action before starting any tests
+      ansible.builtin.debug:
+        msg:
+          device: "{{ smart_device.path }}"
+          serial: "{{ smart_device.serial }}"
+          current_status: "{{ smart_info.ata_smart_data.self_test.status }}"
+          action: "{{ 'Preserve the running test; do not restart it.' if smart_running else 'Start one normal background long self-test.' }}"
+          estimated_minutes: "{{ smart_info.ata_smart_data.self_test.polling_minutes.extended }}"
+
+    # Linear execution and any_errors_fatal keep all host checks before this task.
+    # No captive, force, abort, cleanup or provisioning options are used.
+    - name: Start a normal background long test only on an idle device
+      ansible.builtin.command:
+        argv: [smartctl, --json=o, -t, long, "{{ smart_device.path }}"]
+      register: smart_start
+      changed_when: smart_start.rc == 0
+      failed_when: false
+      when: not smart_running
+
+    - name: Display the actual start result and drive estimate
+      ansible.builtin.debug:
+        msg:
+          rc: "{{ smart_start.rc }}"
+          stderr: "{{ smart_start.stderr | default('') }}"
+          stdout: "{{ smart_start.stdout | default('') }}"
+      when: not smart_running
+
+    - name: Require successful start-command execution
+      ansible.builtin.assert:
+        that:
+          - smart_start.rc == 0
+        fail_msg: "The test-start command failed. Do not retry blindly; inspect current progress with playbook 12."
+      when: not smart_running
+
+    - name: Explain the next check
+      ansible.builtin.debug:
+        msg:
+          - "Run 12-ceph-smart-selftest-report.yml now to check actual progress, then again after the drive's estimate."
+          - "A successful start is not a completed or passed test. Tests run in the background."
+          - "An approved repeat run may start a new test after an earlier test has finished; running tests are preserved."
+          - "This does not authorize disk cleanup, OSD creation or OpenStack changes."
